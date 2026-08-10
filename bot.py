@@ -74,7 +74,6 @@ import hashlib
 import json
 import uuid
 import signal
-import string
 try:
     from cryptography.fernet import Fernet, InvalidToken
 except ImportError:
@@ -84,6 +83,7 @@ from collections import Counter
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from datetime import datetime, timezone, timedelta
 from html import escape as hesc
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
@@ -122,7 +122,6 @@ CLONE_DB_PATH = os.environ.get("CLONE_DB_PATH", "")
 CLONE_ADMIN_IDS = [int(x) for x in os.environ.get("CLONE_ADMIN_IDS", "").split(",") if x.strip().isdigit()]
 MASTER_USERNAME = os.environ.get("MASTER_USERNAME", "").lstrip("@")
 MASTER_REGISTRY_DB_PATH = os.environ.get("MASTER_REGISTRY_DB_PATH", "")
-CLONE_NAME_ENV = os.environ.get("CLONE_NAME", "")
 
 _admin_ids_raw = os.environ.get("ADMIN_IDS", "5888777479")
 try:
@@ -152,21 +151,6 @@ def _resolve_db_path() -> str:
 DB_PATH = CLONE_DB_PATH or _resolve_db_path()
 BOT_STARTED_AT = time.time()
 V3_PAGE_SIZE = 6
-_RATE_LIMIT: dict[tuple[int,str], float] = {}
-
-def rate_limited(user_id: int, action: str, cooldown: float = 1.0) -> bool:
-    now = time.monotonic()
-    key = (user_id, action)
-    previous = _RATE_LIMIT.get(key, 0.0)
-    if now - previous < cooldown:
-        return True
-    _RATE_LIMIT[key] = now
-    if len(_RATE_LIMIT) > 10000:
-        cutoff = now - 300
-        for k, v in list(_RATE_LIMIT.items()):
-            if v < cutoff:
-                _RATE_LIMIT.pop(k, None)
-    return False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -177,26 +161,6 @@ logger = logging.getLogger("gmap_dual_bot")
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
-
-async def is_clone_admin(user_id: int) -> bool:
-    if not CLONE_MODE:
-        return False
-    try:
-        return await clone_admin_authorized(user_id)
-    except Exception:
-        return False
-
-def is_effective_admin(user_id: int) -> bool:
-    # Synchronous fast path for Master admins. Clone admins are checked
-    # asynchronously at call sites where authoritative DB state is required.
-    return user_id in ADMIN_IDS or (CLONE_MODE and user_id in CLONE_ADMIN_IDS)
-
-async def is_effective_admin_async(user_id: int) -> bool:
-    if user_id in ADMIN_IDS:
-        return True
-    if CLONE_MODE:
-        return await is_clone_admin(user_id)
-    return False
 
 
 def friend_word(n: int) -> str:
@@ -278,48 +242,44 @@ def pretty_number(canonical: str) -> str:
 # Editable UI content — every listed message/button can be changed from /admin
 # ---------------------------------------------------------------------------
 UI_MESSAGES = {
-    "admin_panel": ("👑 <b>ADMIN CONTROL CENTER</b>\n━━━━━━━━━━━━━━━━━━━━\n\n😀 <b>Welcome, {admin_name}!</b>\n\nManage users, referrals, rewards, channels and settings."),
-    "start_admin": ("👑 <b>ADMIN CONTROL CENTER</b>\n━━━━━━━━━━━━━━━━━━━━\n\n😀 <b>Welcome, {admin_name}!</b>\n\nYour command center is ready."),
-    "gate": ("📢 <b>JOIN REQUIRED CHANNELS</b>\n━━━━━━━━━━━━━━━━━━━━\n\nJoin all required channels to continue."),
-    "captcha": ("🧩 <b>CAPTCHA</b>\n━━━━━━━━━━━━━━━━━━━━\n\nWhat is <b>{question}</b>?"),
-    "phone": ("📱 <b>PHONE VERIFICATION</b>\n━━━━━━━━━━━━━━━━━━━━\n\n🇮🇳 Share your own Indian (+91) mobile number to continue.\n\nTap <b>{share_button}</b> below."),
-    "restricted": ("⛔ <b>Access Restricted</b>\n━━━━━━━━━━━━━━━━━━━━\n\nPlease contact the administrator if you believe this is a mistake."),
-    "main_locked": ("🤖 <b>{bot_name}</b>\n━━━━━━━━━━━━━━━━━━━━\n\n👋 Welcome, {first_name}\n\n👥 Referrals: <b>{count}/{required}</b>\n{progress}\n\n🎁 Reward: 🔒 Locked"),
-    "main_unlocked": ("🤖 <b>{bot_name}</b>\n━━━━━━━━━━━━━━━━━━━━\n\n👋 Welcome, {first_name}\n\n👥 Referrals: <b>{count}/{required}</b>\n{progress}\n\n🎁 Reward: <b>AVAILABLE</b>"),
-    "referral_link": ("🔗 <b>REFER & EARN</b>\n━━━━━━━━━━━━━━━━━━━━\n\nInvite friends using your personal link.\n\n👥 Referrals: <b>{count}</b>\n🎯 Target: <b>{required}</b>\n\n🎁 Reward:\n{reward}\n\nYour Link:\n<code>{link}</code>"),
+    "admin_panel": ("👑 <b>ADMIN CONTROL CENTER</b>\n\n😀 <b>Welcome, {admin_name}!</b>\n\nYour command center is ready.\nManage your bot, users, rewards, channels, content and system settings from one place. 🔥\n\n🚨 <i>Everything under your control.</i>"),
+    "start_admin": ("👑 <b>Welcome, Admin!</b>\n\n✨ Your control panel is ready.\n🛠 You can customize messages, buttons, premium/custom emoji, banners and every major user-facing screen."),
+    "gate": ("🔒 <b>JOIN CHANNEL</b>\n\nBot को इस्तेमाल करने के लिए पहले required channel join करें."),
+    "captcha": ("🧩 <b>Step 2 — Human Verification</b>\n\n✨ Complete this quick verification to continue.\n\nWhat is <b>{question}</b>?"),
+    "phone": ("📱 <b>Step 3 — Phone Verification</b>\n\n🇮🇳 Only your own Indian (+91) number is accepted.\n\n✨ Tap <b>{share_button}</b> below to verify securely."),
+    "restricted": ("⛔ <b>Access Restricted</b>\n\nYour verification could not be completed.\n\n👨‍💼 If you believe this is a mistake, contact the admin below."),
+    "main_locked": ("🤖 <b>{bot_name}</b>\n\n👋 Welcome, {first_name}!\n\n👥 Referrals: <b>{count}/{required}</b>\n🎁 Reward: <b>{reward_status}</b>"),
+    "main_unlocked": ("🤖 <b>{bot_name}</b>\n\n👋 Welcome, {first_name}!\n\n👥 Referrals: <b>{count}/{required}</b>\n🎁 Reward: <b>{reward_status}</b>"),
+    "referral_link": ("🔗 <b>REFER & EARN</b>\n\nInvite your friends and earn rewards.\n\n👥 Referrals: <b>{referrals}</b>\n🎯 Required: <b>{required_referrals}</b>\n🎁 Reward: <b>{reward}</b>\n\nYour Personal Link:\n<code>{link}</code>"),
     "share_caption": "🎁 Join me on {bot_name} and earn rewards! 🚀",
-    "stats": ("📊 <b>MY STATUS</b>\n━━━━━━━━━━━━━━━━━━━━\n\n👥 Total Referrals: <b>{count}</b>\n🎯 Required: <b>{required}</b>\n✅ Successful: <b>{successful}</b>\n🎁 Rewards Received: <b>{reward_count}</b>\n📱 Phone: <b>{phone}</b>\n🔒 Verification: <b>{verification}</b>\n\n🎁 Latest Reward:\n{latest_reward}"),
-    "help": ("ℹ️ <b>HOW IT WORKS</b>\n━━━━━━━━━━━━━━━━━━━━\n\n1️⃣ Join required channels.\n2️⃣ Complete CAPTCHA.\n3️⃣ Verify your Indian number.\n4️⃣ Refer genuine users.\n5️⃣ Receive eligible rewards."),
-    "invalid_referral": ("⚠️ <b>Referral Could Not Be Verified</b>\n\nThe invited user did not complete valid verification."),
-    "reward": ("🎉 <b>REWARD UNLOCKED</b>\n━━━━━━━━━━━━━━━━━━━━\n\n🎁 <b>Your Agent Number</b>\n<code>{number}</code>\n\n{caption}\n\n✅ Status: Delivered\n📅 Received: {reward_date}"),
-    "reward_empty": ("🎉 <b>Referral completed</b>\n\n⚠️ Reward inventory is temporarily unavailable. Please contact the administrator."),
-    "no_reward": ("🎁 <b>MY REWARD</b>\n━━━━━━━━━━━━━━━━━━━━\n\n🔒 No active reward is available yet."),
+    "stats": ("📊 <b>MY STATUS</b>\n\n👥 Total Referrals: <b>{count}</b>\n✅ Successful: <b>{count}</b>\n🎯 Required: <b>{required}</b>\n🎁 Rewards Received: <b>{reward_count}</b>\n📱 Phone: <b>{phone}</b>\n🔒 Access: <b>{access}</b>\n\n🎁 Latest Reward: <b>{latest_reward}</b>"),
+    "help": ("ℹ️ <b>How {bot_name} Works</b>\n━━━━━━━━━━━━━━━━━━━━\n\n1️⃣ Join the required channel(s).\n2️⃣ Complete the quick verification.\n3️⃣ Verify your Indian (+91) number.\n4️⃣ Share your referral link.\n5️⃣ Earn your reward after a successful referral.\n\n✨ Real users only. Fair play for everyone."),
+    "invalid_referral": ("⚠️ <b>Referral Could Not Be Verified</b>\n\nOne of your invited users did not complete valid verification.\n\n✨ Invite a real Indian user to earn your reward."),
+    "reward": ("🎉 <b>REWARD UNLOCKED</b>\n\n━━━━━━━━━━━━━━━━\n\n🎁 <b>Your Agent Number</b>\n\n<code>{number}</code>\n\n━━━━━━━━━━━━━━━━\n\n✅ Reward Status: Delivered\n📅 Received: {reward_date}\n\n{caption}"),
+    "reward_empty": ("🎉 <b>Your referral is complete!</b>\n\n⚠️ Reward numbers are temporarily unavailable.\n\n👨‍💼 Please contact the admin — your reward is reserved."),
     "no_user": "Please send /start first.",
     "cancelled": "❌ <b>Action cancelled.</b>",
-    "message_saved": "✅ <b>Message updated successfully!</b>",
-    "button_saved": "✅ <b>Button label updated!</b>",
+    "message_saved": "✅ <b>Message updated successfully!</b>\n\n✨ Your formatting and custom/premium emoji entities are preserved.",
+    "button_saved": "✅ <b>Button label updated!</b>\n\n✨ Unicode emoji are supported in button labels.",
 }
+
 UI_BUTTONS = {
     "share_number": "📱 Share My Number",
-    "join_continue": "Continue",
+    "join_continue": "✅ I've Joined — Continue",
     "contact_admin": "👨‍💼 Contact Admin",
     "referral_link": "🔗 REFER & EARN",
     "referral_reward": "🔗 REFER & EARN",
     "stats": "📊 STATUS",
     "my_reward": "🎁 MY REWARD",
-    "share_friend": "📤 SHARE",
-    "copy": "📋 COPY",
-    "back": "⬅️ BACK",
-    "cancel": "✖️ CANCEL",
+    "share_friend": "📤 Share with a Friend",
+    "back": "⬅️ Back",
+    "cancel": "✖️ Cancel",
     "admin_editor": "✏️ Message & Button Editor",
     "message_editor": "📝 Edit Messages",
     "button_editor": "🔘 Edit Buttons",
     "preview": "👁 Preview",
-    "open_whatsapp": "💬 OPEN WHATSAPP",
-    "resend_reward": "♻️ RESEND LATEST REWARD",
-    "revoke_reward": "⚠️ REVOKE REWARD",
+    "open_whatsapp": "💬 Open on WhatsApp",
 }
-
 
 
 # ---------------------------------------------------------------------------
@@ -336,14 +296,14 @@ UI_THEME = {
 UI_LAYOUT = {"join_columns": 1, "status_columns": 1}
 UI_STATUS = {
     "NOT_JOINED": "❌ Not Joined",
-    "REQUESTED": "⏳",
-    "PENDING_APPROVAL": "⏳",
-    "APPROVED": "⏳",
-    "MEMBER": "✅",
-    "LEFT": "❌",
-    "KICKED": "❌",
-    "EXPIRED": "❌",
-    "ERROR": "⚠️",
+    "REQUESTED": "⏳ Approval Pending",
+    "PENDING_APPROVAL": "⏳ Approval Pending",
+    "APPROVED": "✅ Approved — Verify Membership",
+    "MEMBER": "🟢 Joined",
+    "LEFT": "❌ Left",
+    "KICKED": "🚫 Removed",
+    "EXPIRED": "⌛ Request Expired",
+    "ERROR": "⚠️ Verification Error",
 }
 UI_BRANDING = {"master_locked": True}
 
@@ -358,81 +318,147 @@ async def branding_footer() -> str:
     return await get_powered_by_text()
 
 async def get_powered_by_text() -> str:
-    if not CLONE_MODE:
-        return ""
-    username = (MASTER_USERNAME or await get_setting("master_username", "")).lstrip("@").strip()
-    return f"⚡ Powered by @{username}" if username else "⚡ Powered by Master"
+    # Clone identity is fully independent; master branding is never injected into clone user UI.
+    return ""
+
 
 def add_powered_by(text: str) -> str:
     if not CLONE_MODE:
         return text
     return text
 
-class _SafeTemplateValue(str):
-    """Marks trusted/admin-authored HTML fragments as safe for template rendering."""
+ALLOWED_HTML_TAGS = {"b","strong","i","em","u","ins","s","strike","del","code","pre","a","blockquote","tg-spoiler","tg-emoji"}
+_VAR_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+KNOWN_TEMPLATE_VARIABLES = {"admin_name","admin_first_name","admin_last_name","admin_username","admin_id","user_name","first_name","last_name","username","user_id","bot_name","bot_username","bot_id","clone_name","clone_id","clone_username","referrals","referral_count","required_referrals","remaining_referrals","referral_link","progress","reward","reward_number","reward_count","reward_status","reward_date","channel_name","channel_username","channel_link","total_users","today_users","total_rewards","available_rewards","date","time","datetime","question","share_button","required","count","friends","phone","access","latest_reward","caption","link"}
 
-def safe_html(value: object) -> _SafeTemplateValue:
-    return _SafeTemplateValue("" if value is None else str(value))
+class _TelegramHTMLValidator(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.stack = []
+        self.errors = []
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag not in ALLOWED_HTML_TAGS:
+            self.errors.append(f"Unsupported HTML tag: <{tag}>")
+            return
+        if tag not in {"br"}:
+            self.stack.append(tag)
+    def handle_startendtag(self, tag, attrs):
+        if tag.lower() not in ALLOWED_HTML_TAGS:
+            self.errors.append(f"Unsupported HTML tag: <{tag}/>")
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag not in ALLOWED_HTML_TAGS:
+            self.errors.append(f"Unsupported HTML tag: </{tag}>")
+            return
+        if self.stack:
+            if self.stack[-1] == tag:
+                self.stack.pop()
+            elif tag in self.stack:
+                self.errors.append(f"Mismatched closing tag: </{tag}>")
+                self.stack.remove(tag)
+            else:
+                self.errors.append(f"Unexpected closing tag: </{tag}>")
+    def close(self):
+        super().close()
+        if self.stack:
+            self.errors.append("Unclosed HTML tags: " + ", ".join(self.stack))
 
-_HTML_TAG_RE = re.compile(r"</?([a-zA-Z0-9]+)(?:\\s[^>]*)?>")
-_ALLOWED_HTML_TAGS = {"b","strong","i","em","u","s","code","pre","a"}
-
-def _validate_template_html(template: str) -> tuple[bool, list[str]]:
-    unknown = []
-    for match in _HTML_TAG_RE.finditer(template):
-        if match.group(1).lower() not in _ALLOWED_HTML_TAGS:
-            unknown.append(match.group(1).lower())
-    return (not unknown), sorted(set(unknown))
-
-def _render_template(template: str, context: dict) -> str:
-    """Render admin-authored HTML while escaping dynamic values."""
-    class SafeFormatter(string.Formatter):
-        pass
-    values = {}
-    for key, value in context.items():
-        values[key] = value if isinstance(value, _SafeTemplateValue) else hesc("" if value is None else str(value))
+def validate_template_html(template: str) -> list[str]:
+    parser = _TelegramHTMLValidator()
     try:
-        rendered = template.format_map(DefaultFormatDict(values))
-    except Exception:
-        rendered = template
-    rendered = re.sub(r"(?i)</?(?:div|span|font|center|h[1-6])(?:\\s[^>]*)?>", "", rendered)
-    return rendered
+        parser.feed(template)
+        parser.close()
+    except Exception as exc:
+        parser.errors.append(type(exc).__name__)
+    return parser.errors
 
-class DefaultFormatDict(dict):
-    def __missing__(self, key):
+def template_variables(template: str) -> set[str]:
+    return {m.group(1) for m in _VAR_RE.finditer(template)}
+
+class SafeHTML(str):
+    """Trusted Telegram HTML fragment authored by the admin/system."""
+
+def _safe_value(value) -> str:
+    if value is None:
         return ""
+    if isinstance(value, SafeHTML):
+        return str(value)
+    return hesc(str(value), quote=False)
 
-def _unknown_template_variables(template: str, allowed: set[str]) -> list[str]:
-    found = []
-    for _, field_name, _, _ in string.Formatter().parse(template):
-        if field_name and field_name not in allowed:
-            found.append("{" + field_name + "}")
-    return sorted(set(found))
+def render_template(template: str, context: dict) -> str:
+    """Render a Telegram HTML template without escaping the template itself.
+    Only dynamic values are escaped, preserving admin-authored formatting."""
+    def repl(match):
+        key = match.group(1)
+        return _safe_value(context.get(key, match.group(0)))
+    return _VAR_RE.sub(repl, template)
+
+async def bot_identity(bot: Bot | None = None) -> dict:
+    configured_name = await get_setting("bot_name", "")
+    configured_username = (await get_setting("bot_username", "")).lstrip("@")
+    configured_id = await get_setting("bot_id", "")
+    if bot is not None:
+        try:
+            me = await bot.get_me()
+            if not configured_name: configured_name = me.full_name or me.first_name or me.username or "Bot"
+            if not configured_username: configured_username = me.username or ""
+            if not configured_id: configured_id = str(me.id)
+        except Exception:
+            pass
+    return {"bot_name": configured_name or "Bot", "bot_username": configured_username or "", "bot_id": configured_id or ""}
+
+def name_from_telegram(user) -> str:
+    if getattr(user, "first_name", None): return str(user.first_name)
+    full = " ".join(x for x in [getattr(user, "first_name", None), getattr(user, "last_name", None)] if x)
+    if full: return full
+    if getattr(user, "username", None): return f"@{user.username}"
+    return "User"
+
+async def user_context(user_id: int, bot: Bot | None = None) -> dict:
+    row = await get_user(user_id)
+    ctx = {}
+    if row:
+        first = row["first_name"] or ""
+        username = row["username"] or ""
+        name = first or (f"@{username}" if username else "User")
+        ctx.update({"user_name": name, "first_name": first or name, "last_name": "", "username": username and f"@{username}" or "", "user_id": user_id})
+        ctx.update({"referrals": row["referral_count"], "referral_count": row["referral_count"], "phone": pretty_number(row["phone"]) if row["phone"] else "", "reward_status": "Delivered" if row["reward_sent"] else "Locked"})
+    else:
+        ctx.update({"user_name":"User","first_name":"User","last_name":"","username":"","user_id":user_id,"referrals":0,"referral_count":0,"phone":"","reward_status":"Locked"})
+    ctx.update(await bot_identity(bot))
+    return ctx
 
 async def ui_message(key: str, default: str | None = None, **kwargs) -> str:
     template = await get_setting(f"ui_msg:{key}", UI_MESSAGES.get(key, default or key))
-    ok, unknown_tags = _validate_template_html(template)
-    if not ok:
-        logger.warning("Unsupported HTML tags in message template %s: %s", key, unknown_tags)
-    rendered = _render_template(template, kwargs)
+    context = dict(kwargs)
+    if "bot_name" not in context:
+        context.update(await bot_identity())
+    rendered = render_template(template, context)
     if CLONE_MODE:
         powered = await get_powered_by_text()
         if powered and powered not in rendered:
-            footer = f"━━━━━━━━━━━━━━ {powered} ━━━━━━━━━━━━━━"
-            rendered = rendered[:max(0, 4096-len(footer)-2)].rstrip() + "\n\n" + footer
-    return rendered
-
+            footer = f"\n\n━━━━━━━━━━━━━━ {powered} ━━━━━━━━━━━━━━"
+            rendered = (rendered[:max(0,4096-len(footer))] + footer).strip()
+    return rendered[:4096]
 
 async def ui_button(key: str, default: str | None = None, **kwargs) -> str:
     value = await get_setting(f"ui_btn:{key}", UI_BUTTONS.get(key, default or key))
-    try:
-        return value.format(**kwargs)
-    except (KeyError, ValueError):
-        return value
+    return render_template(value, kwargs)
 
-
-async def save_ui_message(key: str, value: str) -> None:
+async def save_ui_message(key: str, value: str, changed_by: int | None = None) -> None:
+    errors = validate_template_html(value)
+    if errors:
+        raise ValueError("; ".join(errors[:3]))
+    unknown=template_variables(value)-KNOWN_TEMPLATE_VARIABLES
+    if unknown:
+        raise ValueError("Unknown variable(s): " + ", ".join(sorted(unknown)[:8]))
     await set_setting(f"ui_msg:{key}", value)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur=await db.execute("SELECT COALESCE(MAX(version),0) FROM message_versions WHERE message_key=?",(key,))
+        version=int((await cur.fetchone())[0])+1
+        await db.execute("INSERT INTO message_versions(message_key,version,content,created_by,created_at) VALUES(?,?,?,?,?)",(key,version,value,changed_by,datetime.now(timezone.utc).isoformat()))
+        await db.commit()
 
 async def save_ui_button(key: str, value: str) -> None:
     await set_setting(f"ui_btn:{key}", value)
@@ -446,16 +472,16 @@ FEATURE_NAMES = (
     "referral", "referral_adjustment", "reward_claim", "reward_pool",
     "reward_caption", "reward_history", "reward_reset",
     "channel_view", "channel_manage", "join_requests", "force_join",
-    "captcha", "phone_verification",
+    "captcha", "phone_verification", "verification",
     "broadcast", "scheduled_broadcast",
     "basic_analytics", "advanced_analytics", "charts",
     "content_view", "content_edit", "content_reset", "button_edit", "banner_edit",
     "backup", "diagnostics", "maintenance", "csv_export", "settings",
 )
 BASIC_FEATURES = {
-    "dashboard","users","user_search","referral","reward_claim","reward_history","reward_caption",
-    "channel_view","force_join","captcha","phone_verification","basic_analytics",
-    "content_view","content_edit","button_edit","settings",
+    "dashboard","users","user_search","referral","reward_claim","reward_caption",
+    "channel_view","force_join","captcha","phone_verification","verification","basic_analytics",
+    "content_view","settings",
 }
 STANDARD_FEATURES = BASIC_FEATURES | {
     "user_moderation","referral_adjustment","reward_pool","reward_history","reward_reset",
@@ -473,7 +499,7 @@ CLONE_ROLE_FEATURES = {
     "OWNER": {"*"},
     "ADMIN": {"*"},
     "MODERATOR": {"users","user_search","user_moderation","referral_adjustment"},
-    "SUPPORT": {"users","user_search","captcha","phone_verification"},
+    "SUPPORT": {"users","user_search","verification"},
     "VIEWER": {"dashboard","basic_analytics"},
 }
 
@@ -658,50 +684,6 @@ async def init_db() -> None:
             )
             """
         )
-        # Persistent reward ledger. reward_handouts is retained for backwards compatibility;
-        # this table is the source of truth for recovery/revoke/history.
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS rewards (
-                reward_id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id             INTEGER NOT NULL,
-                referral_id         INTEGER,
-                reward_type         TEXT NOT NULL DEFAULT 'AGENT_NUMBER',
-                reward_value        TEXT,
-                reward_number       TEXT NOT NULL,
-                reward_status       TEXT NOT NULL DEFAULT 'DELIVERED',
-                created_at          TEXT NOT NULL,
-                delivered_at        TEXT,
-                message_id          INTEGER,
-                chat_id             INTEGER,
-                wa_link             TEXT,
-                recovery_count      INTEGER NOT NULL DEFAULT 0,
-                last_recovered_at   TEXT,
-                revoked_at          TEXT,
-                revoked_by          INTEGER
-            )
-            """
-        )
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS referral_events (
-                referral_id   INTEGER PRIMARY KEY AUTOINCREMENT,
-                referred_user_id INTEGER NOT NULL UNIQUE,
-                referrer_id   INTEGER NOT NULL,
-                status        TEXT NOT NULL DEFAULT 'CREDITED',
-                created_at    TEXT NOT NULL,
-                UNIQUE(referrer_id, referred_user_id)
-            )
-            """
-        )
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_rewards_user_status ON rewards(user_id,reward_status)")
-        try:
-            await db.execute("ALTER TABLE rewards ADD COLUMN milestone INTEGER")
-        except Exception:
-            pass
-        await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_rewards_user_milestone ON rewards(user_id,milestone) WHERE milestone IS NOT NULL")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_rewards_created ON rewards(created_at)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_referral_events_referrer ON referral_events(referrer_id)")
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS user_banner_messages (
@@ -718,13 +700,6 @@ async def init_db() -> None:
         await db.execute("""CREATE TABLE IF NOT EXISTS audit_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER NOT NULL, action TEXT NOT NULL,
             target_user_id INTEGER, details TEXT, before_value TEXT, after_value TEXT, created_at TEXT NOT NULL
-        )""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS message_versions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_key TEXT NOT NULL,
-            admin_id INTEGER NOT NULL,
-            value TEXT NOT NULL,
-            created_at TEXT NOT NULL
         )""")
         await db.execute("""CREATE TABLE IF NOT EXISTS broadcast_campaigns (
             id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER NOT NULL, audience TEXT NOT NULL,
@@ -805,7 +780,6 @@ async def init_db() -> None:
         # Migrations for databases created by an older version of this bot.
         for sql in (
             "ALTER TABLE users ADD COLUMN last_activity TEXT",
-            "ALTER TABLE users ADD COLUMN last_name TEXT",
             "ALTER TABLE users ADD COLUMN phone TEXT",
             "ALTER TABLE users ADD COLUMN phone_verified INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE users ADD COLUMN captcha_passed INTEGER NOT NULL DEFAULT 0",
@@ -819,12 +793,15 @@ async def init_db() -> None:
                 pass  # column already exists
 
         defaults = {
-            "schema_version": "6",
             "required_referrals": "1",
+            "reward_type": "agent_number",
+            "reward_quantity": "1",
+            "reward_limit": "0",
+            "bot_name": "",
+            "bot_username": "",
+            "bot_id": "",
             "bot_mode": "refer",  # "refer" | "task"
-            "clone_name": "",
-            "configured_bot_name": "",
-            "admin_username": "",  # configured contact username
+            "admin_username": "YourAdminUsername",  # fallback contact username
             "admin_contact_id": "",  # numeric Telegram ID, preferred
             "reward_caption": (
                 "Here is your reward number 👇\nMessage it on WhatsApp to claim."
@@ -846,7 +823,7 @@ async def init_db() -> None:
             "join_expired_today": "0",
             "maintenance_mode": "0",
             "broadcast_delay": "0.07",
-            "maintenance_message": "🛠 <b>Temporarily Under Maintenance</b>\n\n✨ Please try again shortly.",
+            "maintenance_message": "🛠 <b>Temporarily Under Maintenance</b>\n\n✨ {bot_name} is being improved. Please try again shortly.",
             "reward_cooldown_seconds": "0",
             "reward_failure_mode": "notify",
             "active_users_days": "30",
@@ -856,9 +833,6 @@ async def init_db() -> None:
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                 (key, value),
             )
-        if CLONE_MODE and CLONE_NAME_ENV:
-            await db.execute("UPDATE settings SET value=? WHERE key='clone_name'", (CLONE_NAME_ENV,))
-            await db.execute("UPDATE settings SET value=? WHERE key='configured_bot_name'", (CLONE_NAME_ENV,))
 
         # Seed package templates without overwriting Master customisations.
         for package_name, feature_set in PACKAGE_FEATURES.items():
@@ -886,22 +860,6 @@ async def init_db() -> None:
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                 (f"ui_btn:{key}", value),
             )
-        # Non-destructive migration of legacy hardcoded identity text.
-        cur = await db.execute("SELECT key,value FROM settings WHERE key LIKE 'ui_msg:%'")
-        legacy_rows = await cur.fetchall()
-        for setting_key, setting_value in legacy_rows:
-            if not setting_value:
-                continue
-            updated_value = setting_value.replace("Gmap Task Board", "{bot_name}")
-            updated_value = updated_value.replace("Welcome, Admin!", "Welcome, {admin_name}!")
-            if updated_value != setting_value:
-                await db.execute("UPDATE settings SET value=? WHERE key=?", (updated_value, setting_key))
-
-        for banner_key in ("refer_banner_caption","task_banner_caption","maintenance_message"):
-            cur = await db.execute("SELECT value FROM settings WHERE key=?", (banner_key,))
-            row = await cur.fetchone()
-            if row and row[0] and "Gmap Task Board" in row[0]:
-                await db.execute("UPDATE settings SET value=? WHERE key=?", (row[0].replace("Gmap Task Board","{bot_name}"), banner_key))
         for admin_id in ADMIN_IDS:
             await db.execute(
                 "INSERT OR IGNORE INTO admin_roles(admin_id, role, created_at) VALUES (?, 'owner', ?)",
@@ -921,6 +879,23 @@ async def init_db() -> None:
         ]
         for sql in indexes:
             await db.execute(sql)
+        for sql in (
+            "CREATE INDEX IF NOT EXISTS idx_reward_records_user ON reward_records(user_id, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_reward_records_status ON reward_records(reward_status, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_referral_events_referrer ON referral_events(referrer_id, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_flow_messages_chat ON flow_messages(chat_id, message_id)",
+        ):
+            await db.execute(sql)
+        # Safe additive backfill: old handouts become permanent delivered rewards.
+        cur = await db.execute("SELECT COUNT(*) FROM reward_records")
+        reward_record_count = int((await cur.fetchone())[0])
+        if reward_record_count == 0:
+            await db.execute("""INSERT INTO reward_records
+                (clone_id,user_id,reward_type,reward_value,reward_number,reward_status,created_at,delivered_at,wa_link)
+                SELECT ?, rh.user_id, 'agent_number', rn.number, rn.number, 'DELIVERED', rh.sent_at, rh.sent_at, ? || rn.number
+                FROM reward_handouts rh JOIN reward_numbers rn ON rn.id=rh.number_id""",
+                (CLONE_ID or None, "https://wa.me/"))
+        await db.execute("INSERT INTO schema_meta(key,value) VALUES('schema_version','6') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
         await db.commit()
 
 
@@ -947,22 +922,22 @@ async def get_user_by_phone(phone: str) -> Optional[aiosqlite.Row]:
         return await cursor.fetchone()
 
 
-async def create_user(user_id, username, first_name, referred_by, last_name="") -> None:
+async def create_user(user_id, username, first_name, referred_by) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO users (user_id, username, first_name, last_name, referred_by, created_at, last_activity) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (user_id, username, first_name, last_name, referred_by,
+            "INSERT INTO users (user_id, username, first_name, referred_by, created_at, last_activity) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, username, first_name, referred_by,
              datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat()),
         )
         await db.commit()
 
 
-async def update_user_profile(user_id, username, first_name, last_name="") -> None:
+async def update_user_profile(user_id, username, first_name) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE users SET username = ?, first_name = ?, last_name = ?, last_activity = ? WHERE user_id = ?",
-            (username, first_name, last_name, datetime.now(timezone.utc).isoformat(), user_id),
+            "UPDATE users SET username = ?, first_name = ?, last_activity = ? WHERE user_id = ?",
+            (username, first_name, datetime.now(timezone.utc).isoformat(), user_id),
         )
         await db.commit()
 
@@ -1030,35 +1005,20 @@ async def adjust_referrals(user_id: int, delta: int) -> None:
 
 
 async def credit_referral_and_mark(referred_user_id: int, referrer_id: int) -> bool:
-    """Atomically credit one referral. Returns False if it was already credited."""
-    if referred_user_id == referrer_id:
-        return False
-    now = datetime.now(timezone.utc).isoformat()
+    now=datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
-        cur = await db.execute(
-            "SELECT referral_credited, referred_by FROM users WHERE user_id=?",
-            (referred_user_id,),
-        )
-        row = await cur.fetchone()
-        if not row or row[0] or row[1] != referrer_id:
-            await db.rollback()
-            return False
+        cur=await db.execute("SELECT referral_credited,referred_by,banned,restricted FROM users WHERE user_id=?",(referred_user_id,)); invited=await cur.fetchone()
+        if not invited or invited[0] or invited[2] or invited[3] or invited[1] != referrer_id:
+            await db.rollback(); return False
+        cur=await db.execute("SELECT banned,restricted FROM users WHERE user_id=?",(referrer_id,)); ref=await cur.fetchone()
+        if not ref or ref[0] or ref[1] or referrer_id==referred_user_id:
+            await db.rollback(); return False
         try:
-            cur = await db.execute(
-                "INSERT INTO referral_events(referred_user_id,referrer_id,status,created_at) VALUES(?,?,?,?)",
-                (referred_user_id, referrer_id, "CREDITED", now),
-            )
+            await db.execute("INSERT INTO referral_events(referred_user_id,referrer_id,created_at) VALUES(?,?,?)",(referred_user_id,referrer_id,now))
         except aiosqlite.IntegrityError:
-            await db.rollback()
-            return False
-        await db.execute(
-            "UPDATE users SET referral_count = referral_count + 1, referral_credited=1 WHERE user_id=? AND referral_credited=0",
-            (referrer_id,),
-        )
-        if cur.rowcount != 1:
-            await db.rollback()
-            return False
+            await db.rollback(); return False
+        await db.execute("UPDATE users SET referral_count=referral_count+1, referral_credited=1 WHERE user_id=?",(referrer_id,))
         await db.commit()
         return True
 
@@ -1359,48 +1319,107 @@ async def pool_stats() -> tuple[int, int, int]:
 
 
 async def claim_number_for_user(user_id: int) -> Optional[str]:
-    """Pick ONE number for this user, honoring the rules:
-      • never the same number twice for the same user,
-      • never a number already handed to MAX_USERS_PER_NUMBER users,
-      • spread out: choose among the LEAST-used eligible numbers, then random,
-        so users don't all get the same one first.
-    Returns the canonical number string, or None if the pool is exhausted.
-    """
+    """Atomically reserve one eligible number for a user."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         await db.execute("BEGIN IMMEDIATE")
-        cursor = await db.execute(
-            """
-            SELECT rn.id, rn.number, rn.handout_count
-            FROM reward_numbers rn
-            WHERE rn.handout_count < ?
-              AND rn.id NOT IN (
-                    SELECT number_id FROM reward_handouts WHERE user_id = ?
-              )
-            ORDER BY rn.handout_count ASC
-            """,
-            (MAX_USERS_PER_NUMBER, user_id),
-        )
-        rows = list(await cursor.fetchall())
+        cur = await db.execute("""SELECT rn.id,rn.number,rn.handout_count FROM reward_numbers rn
+            WHERE rn.handout_count < ? AND rn.id NOT IN
+            (SELECT number_id FROM reward_handouts WHERE user_id=?)
+            ORDER BY rn.handout_count ASC, rn.id ASC""", (MAX_USERS_PER_NUMBER, user_id))
+        rows=list(await cur.fetchall())
         if not rows:
-            return None
-        # All rows with the minimum handout_count are equally "spread" — pick
-        # randomly among them so distribution isn't sequential.
-        min_count = rows[0]["handout_count"]
-        candidates = [r for r in rows if r["handout_count"] == min_count]
-        chosen = random.choice(candidates)
-
-        await db.execute(
-            "UPDATE reward_numbers SET handout_count = handout_count + 1 WHERE id = ?",
-            (chosen["id"],),
-        )
-        await db.execute(
-            "INSERT OR IGNORE INTO reward_handouts (user_id, number_id, sent_at) "
-            "VALUES (?, ?, ?)",
-            (user_id, chosen["id"], datetime.now(timezone.utc).isoformat()),
-        )
+            await db.rollback(); return None
+        minimum=rows[0]["handout_count"]
+        chosen=random.choice([r for r in rows if r["handout_count"]==minimum])
+        now=datetime.now(timezone.utc).isoformat()
+        await db.execute("UPDATE reward_numbers SET handout_count=handout_count+1 WHERE id=? AND handout_count<?", (chosen["id"],MAX_USERS_PER_NUMBER))
+        if db.total_changes == 0:
+            await db.rollback(); return None
+        try:
+            await db.execute("INSERT INTO reward_handouts(user_id,number_id,sent_at) VALUES(?,?,?)",(user_id,chosen["id"],now))
+        except aiosqlite.IntegrityError:
+            await db.rollback(); return None
         await db.commit()
         return chosen["number"]
+
+async def reward_count(user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur=await db.execute("SELECT COUNT(*) FROM reward_records WHERE user_id=? AND reward_status!='REVOKED'",(user_id,))
+        return int((await cur.fetchone())[0])
+
+async def latest_reward(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory=aiosqlite.Row
+        cur=await db.execute("SELECT * FROM reward_records WHERE user_id=? AND reward_status!='REVOKED' ORDER BY reward_id DESC LIMIT 1",(user_id,))
+        return await cur.fetchone()
+
+async def get_reward_records(user_id: int, limit: int=20):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory=aiosqlite.Row
+        cur=await db.execute("SELECT * FROM reward_records WHERE user_id=? ORDER BY reward_id DESC LIMIT ?",(user_id,limit))
+        return list(await cur.fetchall())
+
+async def reserve_reward_for_user(user_id: int, referral_id: int | None = None):
+    """Atomically reserve a number and create its permanent reward record.
+    The DB transaction is the idempotency boundary, so concurrent callbacks cannot allocate twice."""
+    required=max(1,await get_required_referrals())
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory=aiosqlite.Row
+        await db.execute("BEGIN IMMEDIATE")
+        cur=await db.execute("SELECT referral_count FROM users WHERE user_id=?",(user_id,)); u=await cur.fetchone()
+        if not u:
+            await db.rollback(); return None
+        target=int(u["referral_count"])//required
+        cur=await db.execute("SELECT COUNT(*) FROM reward_records WHERE user_id=? AND reward_status!='REVOKED'",(user_id,)); existing=int((await cur.fetchone())[0])
+        if existing>=target:
+            await db.commit(); return None
+        cur=await db.execute("""SELECT rn.id,rn.number,rn.handout_count FROM reward_numbers rn
+            WHERE rn.handout_count<? AND rn.id NOT IN (SELECT number_id FROM reward_handouts WHERE user_id=?)
+            ORDER BY rn.handout_count ASC,rn.id ASC""",(MAX_USERS_PER_NUMBER,user_id))
+        rows=list(await cur.fetchall())
+        if not rows:
+            await db.rollback(); return None
+        minimum=rows[0]["handout_count"]; chosen=random.choice([r for r in rows if r["handout_count"]==minimum])
+        now=datetime.now(timezone.utc).isoformat();
+        await db.execute("UPDATE reward_numbers SET handout_count=handout_count+1 WHERE id=? AND handout_count<?",(chosen["id"],MAX_USERS_PER_NUMBER))
+        if db.total_changes==0:
+            await db.rollback(); return None
+        try:
+            await db.execute("INSERT INTO reward_handouts(user_id,number_id,sent_at) VALUES(?,?,?)",(user_id,chosen["id"],now))
+        except aiosqlite.IntegrityError:
+            await db.rollback(); return None
+        cur=await db.execute("""INSERT INTO reward_records(clone_id,user_id,referral_id,reward_type,reward_value,reward_number,reward_status,created_at,wa_link)\n            VALUES(?,?,?,?,?,?,?,?,?)""",(CLONE_ID or None,user_id,referral_id,await get_setting('reward_type','agent_number'),chosen['number'],chosen['number'],'RESERVED',now,wa_link(chosen['number'])))
+        reward_id=cur.lastrowid
+        await db.commit()
+        return {"reward_id":reward_id,"number":chosen["number"],"number_id":chosen["id"],"created_at":now,"existing_target":existing}
+
+
+async def mark_reward_delivered(reward_id: int, message_id: int, chat_id: int) -> None:
+    now=datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE reward_records SET reward_status='DELIVERED',delivered_at=?,message_id=?,chat_id=? WHERE reward_id=?",(now,message_id,chat_id,reward_id))
+        await db.commit()
+
+async def recover_reward(bot: Bot, user_id: int, reward_id: int | None = None) -> bool:
+    reward = None
+    if reward_id:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory=aiosqlite.Row
+            cur=await db.execute("SELECT * FROM reward_records WHERE reward_id=? AND user_id=?",(reward_id,user_id)); reward=await cur.fetchone()
+    if reward is None: reward=await latest_reward(user_id)
+    if reward is None or reward["reward_status"]=="REVOKED": return False
+    caption=await get_setting("reward_caption","")
+    text=await ui_message("reward",number=pretty_number(reward["reward_number"] or reward["reward_value"] or ""),caption=SafeHTML(caption),reward_date=(reward["delivered_at"] or reward["created_at"])[:10])
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=await ui_button("open_whatsapp","💬 Open WhatsApp"),url=reward["wa_link"] or wa_link(reward["reward_number"]))],[InlineKeyboardButton(text=await ui_button("referral_link","🔗 REFER MORE"),callback_data="menu_link")]])
+    try:
+        msg=await bot.send_message(user_id,text,reply_markup=kb)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE reward_records SET recovery_count=recovery_count+1,last_recovery_at=? WHERE reward_id=?",(datetime.now(timezone.utc).isoformat(),reward["reward_id"]))
+            await db.commit()
+        return True
+    except Exception:
+        logger.exception("Reward recovery failed for %s",user_id); return False
 
 
 # ---------------------------------------------------------------------------
@@ -1449,17 +1468,10 @@ async def get_all_users() -> list[aiosqlite.Row]:
 
 
 async def reset_all_referrals() -> int:
-    """Zero every user's progress WITHOUT deleting anyone. Returns user count.
-    Reward-number handout history is wiped too so numbers can flow again."""
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM users")
-        (count,) = await cur.fetchone()
-        await db.execute(
-            "UPDATE users SET referral_count = 0, referral_credited = 0, reward_sent = 0"
-        )
-        await db.execute("UPDATE rewards SET reward_status='EXPIRED' WHERE reward_status='DELIVERED'")
-        await db.execute("DELETE FROM reward_handouts")
-        await db.execute("UPDATE reward_numbers SET handout_count = 0")
+        cur=await db.execute("SELECT COUNT(*) FROM users"); count=int((await cur.fetchone())[0])
+        await db.execute("UPDATE users SET referral_count=0, referral_credited=0, reward_sent=CASE WHEN EXISTS(SELECT 1 FROM reward_records rr WHERE rr.user_id=users.user_id AND rr.reward_status!='REVOKED') THEN 1 ELSE 0 END")
+        # Preserve reward records/history. Only the referral earning counter is reset.
         await db.commit()
     return count
 
@@ -1476,7 +1488,7 @@ async def get_stats() -> dict:
         total = await count("SELECT COUNT(*) FROM users")
         verified = await count("SELECT COUNT(*) FROM users WHERE phone_verified=1")
         completed = await count("SELECT COUNT(*) FROM users WHERE referral_credited=1")
-        rewards = await count("SELECT COUNT(*) FROM users WHERE reward_sent=1")
+        rewards = await count("SELECT COUNT(*) FROM reward_records WHERE reward_status='DELIVERED'")
         numbers = await count("SELECT COUNT(*) FROM reward_numbers")
         used = await count("SELECT COALESCE(SUM(handout_count),0) FROM reward_numbers")
         return {
@@ -1520,6 +1532,8 @@ async def next_step(user: aiosqlite.Row) -> str:
     Then captcha, then Indian-number verification.
     """
     if not user["joined_gate"]:
+        if not await get_channels():
+            return STEP_CAPTCHA if await get_setting("captcha_enabled","1")=="1" and not user["captcha_passed"] else (STEP_PHONE if await get_setting("phone_verify_enabled","1")=="1" and not user["phone_verified"] else STEP_DONE)
         return STEP_GATE
     if await get_setting("captcha_enabled", "1") == "1" and not user["captcha_passed"]:
         return STEP_CAPTCHA
@@ -1551,162 +1565,27 @@ def wa_link(number: str) -> str:
     return f"https://wa.me/{number}"
 
 
-async def _latest_active_reward(user_id: int) -> Optional[aiosqlite.Row]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT * FROM rewards WHERE user_id=? AND reward_status='DELIVERED' ORDER BY reward_id DESC LIMIT 1",
-            (user_id,),
-        )
-        return await cur.fetchone()
-
-async def _reward_count(user_id: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM rewards WHERE user_id=? AND reward_status!='REVOKED'", (user_id,))
-        return int((await cur.fetchone())[0])
-
-async def _create_reward_ledger(user_id: int, number: str, referral_id: int | None, message_id: int | None, chat_id: int | None) -> int:
-    now = datetime.now(timezone.utc).isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """INSERT INTO rewards(
-                user_id,referral_id,reward_type,reward_value,reward_number,reward_status,
-                created_at,delivered_at,message_id,chat_id,wa_link
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-            (user_id, referral_id, "AGENT_NUMBER", pretty_number(number), number, "DELIVERED",
-             now, now, message_id, chat_id, wa_link(number)),
-        )
-        await db.commit()
-        return int(cur.lastrowid)
-
-async def _send_reward_record(bot: Bot, reward: aiosqlite.Row, *, recovery: bool = False) -> bool:
-    reward_date = (reward["delivered_at"] or reward["created_at"] or "")[:10]
-    caption = await get_setting("reward_caption", "")
-    text = await ui_message(
-        "reward",
-        number=pretty_number(reward["reward_number"]),
-        caption=safe_html(caption),
-        reward_date=reward_date,
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=await ui_button("open_whatsapp", "💬 OPEN WHATSAPP"), url=reward["wa_link"] or wa_link(reward["reward_number"]))],
-        [InlineKeyboardButton(text=await ui_button("referral_link", "🔗 REFER & EARN"), callback_data="menu_link")],
-    ])
-    try:
-        sent = await bot.send_message(reward["user_id"], text, reply_markup=kb)
-        if recovery:
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "UPDATE rewards SET recovery_count=recovery_count+1,last_recovered_at=? WHERE reward_id=?",
-                    (datetime.now(timezone.utc).isoformat(), reward["reward_id"]),
-                )
-                await db.commit()
-        else:
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE rewards SET message_id=?,chat_id=?,delivered_at=COALESCE(delivered_at,?) WHERE reward_id=?",
-                                 (sent.message_id, sent.chat.id, datetime.now(timezone.utc).isoformat(), reward["reward_id"]))
-                await db.commit()
-        await mark_reward_sent(reward["user_id"])
-        return True
-    except TelegramForbiddenError:
-        logger.warning("Reward delivery failed: user %s blocked the bot", reward["user_id"])
-    except Exception:
-        logger.exception("Reward send failed for user %s", reward["user_id"])
-    return False
-
-async def _allocate_reward_atomic(user_id: int, referral_count: int) -> Optional[int]:
-    required = await get_required_referrals()
-    milestone = referral_count // required
-    if milestone < 1:
-        return None
-    now = datetime.now(timezone.utc).isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        await db.execute("BEGIN IMMEDIATE")
-        cur = await db.execute(
-            "SELECT reward_id FROM rewards WHERE user_id=? AND milestone=? AND reward_status!='REVOKED' LIMIT 1",
-            (user_id, milestone),
-        )
-        if await cur.fetchone():
-            await db.rollback()
-            return None
-        cur = await db.execute(
-            """SELECT rn.id,rn.number FROM reward_numbers rn
-               WHERE rn.handout_count < ?
-                 AND NOT EXISTS(SELECT 1 FROM reward_handouts rh WHERE rh.user_id=? AND rh.number_id=rn.id)
-               ORDER BY rn.handout_count ASC,rn.id ASC""",
-            (MAX_USERS_PER_NUMBER, user_id),
-        )
-        rows = list(await cur.fetchall())
-        if not rows:
-            await db.rollback()
-            return None
-        chosen = rows[0]  # least-used eligible number; transaction lock prevents races
-        await db.execute("UPDATE reward_numbers SET handout_count=handout_count+1 WHERE id=?", (chosen["id"],))
-        await db.execute(
-            "INSERT INTO reward_handouts(user_id,number_id,sent_at) VALUES(?,?,?)",
-            (user_id, chosen["id"], now),
-        )
-        cur = await db.execute(
-            """INSERT INTO rewards(
-                user_id,referral_id,reward_type,reward_value,reward_number,reward_status,
-                created_at,delivered_at,chat_id,wa_link,milestone
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-            (user_id, None, "AGENT_NUMBER", pretty_number(chosen["number"]), chosen["number"], "DELIVERED",
-             now, now, user_id, wa_link(chosen["number"]), milestone),
-        )
-        reward_id = int(cur.lastrowid)
-        await db.commit()
-        return reward_id
-
 async def deliver_number_reward(bot: Bot, user_id: int, referral_count: int, referral_id: int | None = None) -> bool:
-    reward_id = await _allocate_reward_atomic(user_id, referral_count)
-    if reward_id is None:
-        # If the milestone already exists, it is not a new allocation.
-        required = await get_required_referrals()
-        if referral_count // required >= 1 and await _reward_count(user_id) >= referral_count // required:
-            return False
+    required=max(1,await get_required_referrals()); quantity=max(1,int(await get_setting("reward_quantity","1") or 1)); limit=max(0,int(await get_setting("reward_limit","0") or 0))
+    target_units=(referral_count//required)*quantity
+    if limit: target_units=min(target_units,limit)
+    delivered=0
+    while await reward_count(user_id)<target_units:
+        reserved=await reserve_reward_for_user(user_id,referral_id)
+        if reserved is None: break
+        caption=await get_setting("reward_caption","")
+        text=await ui_message("reward",number=pretty_number(reserved["number"]),caption=SafeHTML(caption),reward_date=reserved["created_at"][:10])
+        kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=await ui_button("open_whatsapp","💬 Open WhatsApp"),url=wa_link(reserved["number"]))],[InlineKeyboardButton(text=await ui_button("referral_link","🔗 REFER MORE"),callback_data="menu_link")]])
         try:
-            await bot.send_message(user_id, await ui_message("reward_empty"))
+            msg=await bot.send_message(user_id,text,reply_markup=kb); await mark_reward_delivered(reserved["reward_id"],msg.message_id,user_id); await mark_reward_sent(user_id); delivered+=1
+        except TelegramForbiddenError:
+            logger.warning("Reward reserved but user blocked bot: %s",user_id); break
         except Exception:
-            pass
-        return False
-    if referral_id is not None:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE rewards SET referral_id=? WHERE reward_id=?", (referral_id, reward_id))
-            await db.commit()
-    reward = await _get_reward(reward_id)
-    return bool(reward and await _send_reward_record(bot, reward))
-
-
-async def _get_reward(reward_id: int) -> Optional[aiosqlite.Row]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM rewards WHERE reward_id=?", (reward_id,))
-        return await cur.fetchone()
-
-async def recover_latest_reward(bot: Bot, user_id: int) -> bool:
-    reward = await _latest_active_reward(user_id)
-    if not reward:
-        try:
-            await bot.send_message(user_id, await ui_message("no_reward"))
-        except Exception:
-            pass
-        return False
-    return await _send_reward_record(bot, reward, recovery=True)
-
-async def revoke_reward(reward_id: int, admin_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT reward_status FROM rewards WHERE reward_id=?", (reward_id,))
-        row = await cur.fetchone()
-        if not row or row[0] == "REVOKED":
-            return False
-        await db.execute(
-            "UPDATE rewards SET reward_status='REVOKED',revoked_at=?,revoked_by=? WHERE reward_id=? AND reward_status!='REVOKED'",
-            (datetime.now(timezone.utc).isoformat(), admin_id, reward_id),
-        )
-        await db.commit()
-        return True
+            logger.exception("Reward delivery failed for %s",user_id); break
+    if delivered==0 and await reward_count(user_id)==0:
+        try: await bot.send_message(user_id,await ui_message("reward_empty"))
+        except Exception: pass
+    return delivered>0
 
 
 async def notify_invalid_referral(bot: Bot, referrer_id: int) -> None:
@@ -1717,50 +1596,19 @@ async def notify_invalid_referral(bot: Bot, referrer_id: int) -> None:
 
 
 async def maybe_credit_referral(user_id: int, bot: Bot) -> None:
-    """Credit the referrer once the invited user passes EVERY enabled step.
-    Banned/restricted users can neither give nor receive credit."""
-    user = await get_user(user_id)
-    if (
-        user is None
-        or user["referred_by"] is None
-        or user["referral_credited"]
-        or user["banned"]
-        or user["restricted"]
-    ):
-        return
-
-    if not await all_verifications_passed(user):
-        return
-
-    referrer = await get_user(user["referred_by"])
-    if referrer is None or referrer["banned"]:
-        return
-
-    referrer_id = referrer["user_id"]
-    credited = await credit_referral_and_mark(user_id, referrer_id)
-    if not credited:
-        return
-
-    referrer = await get_user(referrer_id)
-    if referrer is None:
-        return
-
-    required = await get_required_referrals()
-    count = referrer["referral_count"]
-
-    # Each COMPLETED referral hands out one number, provided the target is met.
-    if count >= required:
-        await deliver_number_reward(bot, referrer_id, count)
+    user=await get_user(user_id)
+    if not user or user["referred_by"] is None or user["referral_credited"] or user["banned"] or user["restricted"]: return
+    if not await all_verifications_passed(user): return
+    referrer=await get_user(user["referred_by"])
+    if not referrer or referrer["banned"] or referrer["restricted"]: return
+    credited=await credit_referral_and_mark(user_id,referrer["user_id"])
+    if not credited: return
+    referrer=await get_user(referrer["user_id"]); required=await get_required_referrals(); count=referrer["referral_count"]
+    if count>=required and count%required==0:
+        await deliver_number_reward(bot,referrer["user_id"],count,referral_id=user_id)
     else:
-        try:
-            await bot.send_message(
-                referrer_id,
-                f"🎉 <b>+1 referral!</b>\n\n"
-                f"{progress_bar(count, required)}  {count}/{required}\n"
-                f"Only {max(0, required - count)} more to unlock your reward 🚀",
-            )
-        except Exception:
-            pass
+        try: await bot.send_message(referrer["user_id"],f"🎉 <b>+1 referral!</b>\\n\\n{progress_bar(count,required)}  {count}/{required}")
+        except Exception: pass
 
 
 # ---------------------------------------------------------------------------
@@ -1851,11 +1699,6 @@ class AdminGuardMiddleware(BaseMiddleware):
             return
         cb = getattr(event, "data", None)
         category = ACTION_CATEGORY.get(cb, "") if cb else ""
-        if cb and not category:
-            if cb.startswith(("usr_rewards:","usr_resend:","usr_revoke:","usr_revoke_confirm:")):
-                category = "rewards"
-            elif cb.startswith("usr_"):
-                category = "users"
         if category and not await can_admin(user.id, category):
             if hasattr(event, "answer"):
                 try:
@@ -1877,7 +1720,7 @@ async def protected_feature_for_event(event, data) -> str:
         "adm_editor":"content_edit","adm_banner":"banner_edit",
         "adm_backup":"backup","v3_backup":"backup","adm_system":"settings",
         "adm_reset":"reward_reset","adm_mode":"settings","adm_reward":"reward_caption",
-        "adm_required":"referral","adm_setadmin":"settings","adm_export":"csv_export",
+        "adm_required":"referral", "adm_reward_rules":"referral", "adm_reward_rules":"referral","adm_setadmin":"settings","adm_export":"csv_export",
         "jr_toggle":"join_requests","jr_info":"join_requests","jr_center":"join_requests",
         "jr_refresh":"join_requests","jr_health":"join_requests","jr_expire":"join_requests",
         "ui_theme":"content_edit","ui_preview_gate":"content_view",
@@ -1885,10 +1728,7 @@ async def protected_feature_for_event(event, data) -> str:
     if cb in exact:
         return exact[cb]
     prefixes = (
-        ("usr_rewards:", "reward_history"), ("usr_resend:", "reward_history"), ("usr_revoke", "reward_history"),
         ("usr_", "users"), ("ce_m:", "content_edit"), ("ce_b:", "button_edit"),
-        ("ce_preview:", "content_edit"), ("ce_preview_user:", "content_edit"),
-        ("ce_versions:", "content_edit"), ("ce_reset:", "content_edit"), ("ce_reset_confirm:", "content_edit"),
         ("vs_captcha", "captcha"), ("vs_phone", "phone_verification"),
         ("ch_", "channel_manage"), ("num_", "reward_pool"),
         ("v3_user_", "users"), ("v3_reward_", "reward_history"),
@@ -1922,6 +1762,7 @@ def state_feature(state_name: str | None) -> str:
         "waiting_banner_photo":"banner_edit",
         "waiting_reward_caption":"reward_caption",
         "waiting_required_referrals":"referral",
+        "waiting_reward_rules":"referral",
         "waiting_admin_contact":"settings",
         "waiting_find_user":"user_search",
         "waiting_v3_user_search":"users",
@@ -1938,40 +1779,18 @@ def state_feature(state_name: str | None) -> str:
 
 async def v3_analytics(period_days: int | None = None) -> dict:
     now = datetime.now(timezone.utc)
-    cutoff = (now-timedelta(days=period_days)).isoformat() if period_days else None
     async with aiosqlite.connect(DB_PATH) as db:
         async def c(sql, params=()):
-            cur=await db.execute(sql,params)
-            return int((await cur.fetchone())[0])
-        where = "WHERE created_at >= ?" if cutoff else ""
-        params = (cutoff,) if cutoff else ()
+            cur=await db.execute(sql,params); return int((await cur.fetchone())[0])
+        where = "" if not period_days else "WHERE created_at >= ?"
+        params = () if not period_days else ((now-timedelta(days=period_days)).isoformat(),)
         users=await c(f"SELECT COUNT(*) FROM users {where}",params)
         verified=await c(f"SELECT COUNT(*) FROM users {where+' AND' if where else 'WHERE'} phone_verified=1",params)
         referrals=await c(f"SELECT COUNT(*) FROM users {where+' AND' if where else 'WHERE'} referral_credited=1",params)
-        rewards=await c(f"SELECT COUNT(*) FROM rewards {where}",params) if await _table_exists(db,"rewards") else 0
-        delivered=await c(f"SELECT COUNT(*) FROM rewards {where+' AND' if where else 'WHERE'} reward_status='DELIVERED'",params) if rewards else 0
-        revoked=await c(f"SELECT COUNT(*) FROM rewards {where+' AND' if where else 'WHERE'} reward_status='REVOKED'",params) if rewards else 0
-        expired=await c(f"SELECT COUNT(*) FROM rewards {where+' AND' if where else 'WHERE'} reward_status='EXPIRED'",params) if rewards else 0
-        recovered=await c(f"SELECT COALESCE(SUM(recovery_count),0) FROM rewards {where}",params) if rewards else 0
-        pending_join=await c("SELECT COUNT(*) FROM join_request_states WHERE status IN ('REQUESTED','PENDING_APPROVAL','APPROVED')")
-        top=await db.execute(
-            f"SELECT referred_by, COUNT(*) c FROM users {where+' AND' if where else 'WHERE'} referred_by IS NOT NULL AND referral_credited=1 GROUP BY referred_by ORDER BY c DESC LIMIT 10",
-            params
-        )
+        rewards=await c(f"SELECT COUNT(*) FROM users {where+' AND' if where else 'WHERE'} reward_sent=1",params)
+        top=await db.execute(f"SELECT referred_by, COUNT(*) c FROM users {where+' AND' if where else 'WHERE'} referred_by IS NOT NULL AND referral_credited=1 GROUP BY referred_by ORDER BY c DESC LIMIT 10",params)
         top_rows=await top.fetchall()
-        return {
-            "users":users,"verified":verified,"referrals":referrals,"rewards":rewards,
-            "delivered":delivered,"revoked":revoked,"expired":expired,"recovered":recovered,
-            "pending_join":pending_join,
-            "verification_rate":(verified/users*100 if users else 0),
-            "referral_rate":(referrals/users*100 if users else 0),
-            "reward_rate":(delivered/referrals*100 if referrals else 0),
-            "top":top_rows,
-        }
-
-async def _table_exists(db, name: str) -> bool:
-    cur=await db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,))
-    return await cur.fetchone() is not None
+        return {"users":users,"verified":verified,"referrals":referrals,"rewards":rewards,"verification_rate":(verified/users*100 if users else 0),"referral_rate":(referrals/users*100 if users else 0),"reward_rate":(rewards/referrals*100 if referrals else 0),"top":top_rows}
 
 
 async def user_search(query: str, page: int = 0, filt: str = "all") -> tuple[list[aiosqlite.Row], int]:
@@ -2035,20 +1854,12 @@ def gate_keyboard(channels: list[aiosqlite.Row], join_label: str) -> InlineKeybo
 
 
 async def build_gate_keyboard(bot: Bot, user_id: int, channels: list[aiosqlite.Row]) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
+    rows=[]
     for ch in channels:
-        state = await get_join_state(user_id, ch["channel_id"])
-        if await _request_expired(state):
-            await mark_join_expired(user_id, ch["channel_id"])
-            state = await get_join_state(user_id, ch["channel_id"])
-        status = state["status"] if state else "NOT_JOINED"
-        if status == "MEMBER":
-            label = f"✅ {ch['title']}"
-        elif status in {"REQUESTED","PENDING_APPROVAL","APPROVED"}:
-            label = f"⏳ {ch['title']}"
-        else:
-            label = f"📢 {ch['title']}"
-        rows.append([InlineKeyboardButton(text=label, url=ch["invite_link"])])
+        state=await get_join_state(user_id,ch["channel_id"])
+        status=state["status"] if state else "NOT_JOINED"
+        label=("✅ " if status=="MEMBER" else "⏳ " if status in {"REQUESTED","PENDING_APPROVAL","APPROVED"} else "📢 ")+str(ch["title"])
+        rows.append([InlineKeyboardButton(text=label,url=ch["invite_link"])])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -2066,9 +1877,8 @@ async def contact_admin_keyboard() -> InlineKeyboardMarkup:
 
 async def main_menu_keyboard(unlocked: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=await ui_button("referral_link", "🔗 REFER & EARN"), callback_data="menu_link"),
-         InlineKeyboardButton(text=await ui_button("stats", "📊 STATUS"), callback_data="menu_stats")],
-        [InlineKeyboardButton(text=await ui_button("my_reward", "🎁 MY REWARD"), callback_data="my_reward")],
+        [InlineKeyboardButton(text=await ui_button("referral_link","🔗 REFER & EARN"),callback_data="menu_link"), InlineKeyboardButton(text=await ui_button("stats","📊 STATUS"),callback_data="menu_stats")],
+        [InlineKeyboardButton(text=await ui_button("my_reward","🎁 MY REWARD"),callback_data="my_reward")],
     ])
 
 
@@ -2089,7 +1899,7 @@ async def admin_panel_keyboard(admin_id: int | None = None) -> InlineKeyboardMar
             ("👥 Users","users"), ("🤝 Referrals","referral"),
             ("🎁 Rewards","reward_claim"), ("📢 Channels","channel_view"),
             ("🛡 Verification","captcha"), ("📊 Statistics","basic_analytics"),
-            ("🎨 Content","content_edit"), ("⚙️ Settings","settings"),
+            ("🎨 Content","content_view"), ("⚙️ Settings","settings"),
             ("📣 Broadcast","broadcast"), ("🔢 Reward Pool","reward_pool"),
             ("📈 Advanced Analytics","advanced_analytics"), ("📤 CSV Export","csv_export"),
             ("💾 Backup","backup"), ("🩺 Diagnostics","diagnostics"),
@@ -2119,7 +1929,7 @@ async def admin_panel_keyboard(admin_id: int | None = None) -> InlineKeyboardMar
          InlineKeyboardButton(text=mode_label, callback_data="adm_mode")],
         [InlineKeyboardButton(text="✏️ Message & Button Editor", callback_data="adm_editor")],
         [InlineKeyboardButton(text="🎁 Reward Caption", callback_data="adm_reward"),
-         InlineKeyboardButton(text="🔢 Required Refs", callback_data="adm_required")],
+         InlineKeyboardButton(text="⚙️ Reward Rules", callback_data="adm_reward_rules")],
         [InlineKeyboardButton(text="📞 Manage Numbers", callback_data="adm_numbers"),
          InlineKeyboardButton(text="📢 Manage Channels", callback_data="adm_channels")],
         [InlineKeyboardButton(text="🛡 Verification", callback_data="adm_verify"),
@@ -2213,13 +2023,11 @@ def user_card(user: aiosqlite.Row, required: int) -> tuple[str, InlineKeyboardMa
                 InlineKeyboardButton(text="➖1 Referral", callback_data=f"usr_sub:{uid}"),
             ],
             [
-                InlineKeyboardButton(text="🎁 Reward History", callback_data=f"usr_rewards:{uid}"),
-                InlineKeyboardButton(text="♻️ RESEND LATEST", callback_data=f"usr_resend:{uid}"),
+                InlineKeyboardButton(text="🎁 View Rewards", callback_data=f"usr_rewards:{uid}"),
+                InlineKeyboardButton(text="♻️ Resend Latest", callback_data=f"usr_resend:{uid}"),
             ],
-            [
-                InlineKeyboardButton(text="🔁 Reset Reward", callback_data=f"usr_reset:{uid}"),
-                InlineKeyboardButton(text="⬅️ Back", callback_data="adm_back"),
-            ],
+            [InlineKeyboardButton(text="🔁 Reset Flag", callback_data=f"usr_reset:{uid}"),
+             InlineKeyboardButton(text="⬅️ Back", callback_data="adm_back")],
         ]
     )
     return text, kb
@@ -2357,159 +2165,108 @@ async def send_mode_banner(
         return None
 
 
-async def _get_active_flow_message(user_id: int) -> Optional[tuple[int,int]]:
+async def get_flow_message(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT chat_id,message_id FROM active_flow_messages WHERE user_id=?", (user_id,))
-        row = await cur.fetchone()
-    return (int(row[0]), int(row[1])) if row else None
+        db.row_factory=aiosqlite.Row
+        cur=await db.execute("SELECT * FROM flow_messages WHERE user_id=?",(user_id,)); return await cur.fetchone()
 
-async def _set_active_flow_message(user_id: int, chat_id: int, message_id: int) -> None:
+async def set_flow_message(user_id:int,chat_id:int,message_id:int,step:str):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """INSERT INTO active_flow_messages(user_id,chat_id,message_id,updated_at) VALUES(?,?,?,?)
-               ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id,message_id=excluded.message_id,updated_at=excluded.updated_at""",
-            (user_id, chat_id, message_id, datetime.now(timezone.utc).isoformat()),
-        )
-        await db.commit()
+        await db.execute("INSERT INTO flow_messages(user_id,chat_id,message_id,step,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id,message_id=excluded.message_id,step=excluded.step,updated_at=excluded.updated_at",(user_id,chat_id,message_id,step,datetime.now(timezone.utc).isoformat())); await db.commit()
 
-async def _delete_active_flow_message(bot: Bot, user_id: int) -> None:
-    row = await _get_active_flow_message(user_id)
+async def clear_flow_message(user_id:int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM flow_messages WHERE user_id=?",(user_id,)); await db.commit()
+
+async def delete_previous_flow(bot:Bot,user_id:int,chat_id:int):
+    row=await get_flow_message(user_id)
     if row:
-        try:
-            await bot.delete_message(row[0], row[1])
-        except Exception:
-            pass
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM active_flow_messages WHERE user_id=?", (user_id,))
-        await db.commit()
-
-async def _edit_or_send_flow(bot: Bot, chat_id: int, user_id: int, text: str, reply_markup=None, edit_message: Optional[Message]=None) -> Message:
-    candidates = []
-    if edit_message:
-        candidates.append((edit_message.chat.id, edit_message.message_id))
-    active = await _get_active_flow_message(user_id)
-    if active and active not in candidates:
-        candidates.append(active)
-    for cid, mid in candidates:
-        try:
-            msg = await bot.edit_message_text(text, chat_id=cid, message_id=mid, reply_markup=reply_markup)
-            await _set_active_flow_message(user_id, chat_id, msg.message_id)
-            return msg
-        except Exception:
-            pass
-    msg = await bot.send_message(chat_id, text, reply_markup=reply_markup)
-    await _set_active_flow_message(user_id, chat_id, msg.message_id)
-    return msg
+        try: await bot.delete_message(chat_id or row["chat_id"],row["message_id"])
+        except Exception: pass
 
 async def render_gate(bot: Bot, chat_id: int, edit_message: Optional[Message] = None) -> None:
-    user_id = chat_id
-    channels = await get_channels()
-    if not channels:
-        text = await ui_message("gate")
-        await _edit_or_send_flow(bot, chat_id, user_id, text, None, edit_message)
-        return
-    lines = ["📢 <b>JOIN REQUIRED CHANNELS</b>", "━━━━━━━━━━━━━━━━━━━━", ""]
-    all_member = True
-    for ch in channels:
-        state = await get_join_state(user_id, ch["channel_id"])
-        status = state["status"] if state else "NOT_JOINED"
-        icon = "✅" if status == "MEMBER" else ("⏳" if status in {"REQUESTED","PENDING_APPROVAL","APPROVED"} else "📢")
-        lines.append(f"{icon} <b>{hesc(ch['title'] or 'Channel')}</b>")
-        if status != "MEMBER":
-            all_member = False
-    if all_member:
-        lines.append("\n✅ All required channels verified.")
-    text = "\n".join(lines)
-    kb = await build_gate_keyboard(bot, user_id, channels)
-    await _edit_or_send_flow(bot, chat_id, user_id, text, kb, edit_message)
+    user_id=chat_id; channels=await get_channels()
+    text=await ui_message("gate")
+    if channels:
+        text += "\n\n" + "\n".join(f"📢 <b>{hesc(ch['title'])}</b>" for ch in channels)
+    else:
+        text += "\n\nNo required channels are configured."
+    kb=await build_gate_keyboard(bot,user_id,channels)
+    if edit_message:
+        try:
+            await edit_message.edit_text(text,reply_markup=kb)
+            await set_flow_message(user_id,chat_id,edit_message.message_id,STEP_GATE); return
+        except TelegramBadRequest: pass
+    existing=await get_flow_message(user_id)
+    if existing:
+        try:
+            await bot.edit_message_text(text,chat_id=existing["chat_id"],message_id=existing["message_id"],reply_markup=kb)
+            await set_flow_message(user_id,chat_id,existing["message_id"],STEP_GATE); return
+        except Exception: pass
+    await delete_previous_flow(bot,user_id,chat_id)
+    msg=await bot.send_message(chat_id,text,reply_markup=kb)
+    await set_flow_message(user_id,chat_id,msg.message_id,STEP_GATE)
 
 
 async def render_captcha(bot: Bot, chat_id: int, user_id: int, edit_message: Optional[Message] = None) -> None:
-    question, answer, options = build_captcha()
-    await set_captcha_answer(user_id, str(answer))
-    text = await ui_message("captcha", question=question)
-    await _edit_or_send_flow(bot, chat_id, user_id, text, captcha_keyboard(options), edit_message)
+    question,answer,options=build_captcha(); await set_captcha_answer(user_id,str(answer))
+    text=await ui_message("captcha",question=question); kb=captcha_keyboard(options)
+    if edit_message:
+        try: await edit_message.edit_text(text,reply_markup=kb); await set_flow_message(user_id,chat_id,edit_message.message_id,STEP_CAPTCHA); return
+        except TelegramBadRequest: pass
+    existing=await get_flow_message(user_id)
+    if existing:
+        try:
+            await bot.edit_message_text(text,chat_id=existing["chat_id"],message_id=existing["message_id"],reply_markup=kb)
+            await set_flow_message(user_id,chat_id,existing["message_id"],STEP_CAPTCHA); return
+        except Exception: pass
+    await delete_previous_flow(bot,user_id,chat_id); msg=await bot.send_message(chat_id,text,reply_markup=kb); await set_flow_message(user_id,chat_id,msg.message_id,STEP_CAPTCHA)
 
-async def render_phone(bot: Bot, chat_id: int) -> None:
-    # Reply keyboards cannot be edited into inline messages, so remove the old
-    # flow message and send the single phone-verification prompt.
-    user_id = chat_id
-    await _delete_active_flow_message(bot, user_id)
-    msg = await bot.send_message(chat_id, await ui_message("phone", share_button=await ui_button("share_number")), reply_markup=await phone_keyboard())
-    await _set_active_flow_message(user_id, chat_id, msg.message_id)
+async def render_phone(bot: Bot, chat_id: int, user_id: int, edit_message: Optional[Message] = None) -> None:
+    await delete_previous_flow(bot,user_id,chat_id)
+    text=await ui_message("phone",share_button=await ui_button("share_number"))
+    msg=await bot.send_message(chat_id,text,reply_markup=await phone_keyboard())
+    await set_flow_message(user_id,chat_id,msg.message_id,STEP_PHONE)
 
 async def render_contact_admin(bot: Bot, chat_id: int) -> None:
-    await _delete_active_flow_message(bot, chat_id)
-    await bot.send_message(chat_id, await ui_message("restricted"), reply_markup=await contact_admin_keyboard())
-
-async def _bot_display_name(bot: Bot) -> str:
-    configured = await get_setting("configured_bot_name", "")
-    if configured.strip():
-        return configured.strip()
-    clone_name = await get_setting("clone_name", "")
-    if clone_name.strip():
-        return clone_name.strip()
-    try:
-        me = await bot.get_me()
-        return me.first_name or me.username or "Bot"
-    except Exception:
-        return "Bot"
-
-async def _user_display_name(user: aiosqlite.Row) -> str:
-    return user["first_name"] or user["last_name"] or user["username"] or "User"
+    await bot.send_message(chat_id,await ui_message("restricted"),reply_markup=await contact_admin_keyboard())
 
 async def render_main_menu(bot: Bot, chat_id: int, user_id: int, edit_message: Optional[Message] = None) -> None:
-    user = await get_user(user_id)
-    required = await get_required_referrals()
-    referral_count = user["referral_count"] if user else 0
-    reward = await _latest_active_reward(user_id) if user else None
-    unlocked = is_admin(user_id) or reward is not None
-    bot_name = await _bot_display_name(bot)
-    first_name = _user_display_name(user) if user else "User"
-    progress = progress_bar(referral_count, required)
-    if unlocked:
-        text = await ui_message("main_unlocked", bot_name=bot_name, first_name=first_name, count=referral_count,
-                                required=required, progress=progress)
-    else:
-        text = await ui_message("main_locked", bot_name=bot_name, first_name=first_name, required=required,
-                                count=referral_count, progress=progress)
-    kb = await main_menu_keyboard(unlocked)
-    await _delete_user_banner(bot, user_id, chat_id)
-    await _delete_active_flow_message(bot, user_id)
-    # Keep dashboard as one clean message; banner support remains backward-compatible.
-    banner = await send_mode_banner(bot, chat_id, user_id, await get_bot_mode(), text, kb)
-    if banner is None:
-        await bot.send_message(chat_id, text, reply_markup=kb)
+    user=await get_user(user_id); required=await get_required_referrals(); count=user["referral_count"] if user else 0
+    latest=await latest_reward(user_id); rcount=await reward_count(user_id)
+    reward_status="Delivered" if rcount else f"{max(0,required-count)} referrals to unlock"
+    name=await user_context(user_id,bot); name["first_name"]=user["first_name"] if user and user["first_name"] else (f"@{user['username']}" if user and user["username"] else "User")
+    name.update({"required":required,"count":count,"reward_status":reward_status,"reward_count":rcount,"latest_reward":pretty_number(latest["reward_number"]) if latest else "—"})
+    text=await ui_message("main_locked",**name)
+    if count>=required: text=await ui_message("main_unlocked",**name)
+    kb=await main_menu_keyboard(True)
+    # Keep exactly one active flow message. Banner support is retained but the dashboard is a single text message.
+    if edit_message:
+        try: await edit_message.edit_text(text,reply_markup=kb); await set_flow_message(user_id,chat_id,edit_message.message_id,STEP_DONE); return
+        except TelegramBadRequest: pass
+    existing=await get_flow_message(user_id)
+    if existing:
+        try:
+            await bot.edit_message_text(text,chat_id=existing["chat_id"],message_id=existing["message_id"],reply_markup=kb)
+            await set_flow_message(user_id,chat_id,existing["message_id"],STEP_DONE); return
+        except Exception: pass
+    await delete_previous_flow(bot,user_id,chat_id)
+    msg=await bot.send_message(chat_id,text,reply_markup=kb); await set_flow_message(user_id,chat_id,msg.message_id,STEP_DONE)
 
-
-
-async def render_flow(
-    bot: Bot, chat_id: int, user_id: int, edit_message: Optional[Message] = None
-) -> None:
-    user = await get_user(user_id)
-    if user is None:
-        return
-    if user["banned"] and not await is_effective_admin_async(user_id):
-        await bot.send_message(chat_id, "🚫 You are banned from using this bot.")
-        return
-    if user["restricted"] and not await is_effective_admin_async(user_id):
-        await render_contact_admin(bot, chat_id)
-        return
-    if await get_setting("maintenance_mode", "0") == "1" and not is_effective_admin(user_id):
-        await bot.send_message(chat_id, await get_setting("maintenance_message", "🛠 <b>Temporarily Under Maintenance</b>"))
-        return
-    if await is_effective_admin_async(user_id):
-        await render_admin_dashboard(bot, chat_id, user_id)
-        return
-    step = await next_step(user)
-    if step == STEP_GATE:
-        await render_gate(bot, chat_id, edit_message=edit_message)
-    elif step == STEP_CAPTCHA:
-        await render_captcha(bot, chat_id, user_id, edit_message=edit_message)
-    elif step == STEP_PHONE:
-        await render_phone(bot, chat_id)
-    else:
-        await render_main_menu(bot, chat_id, user_id, edit_message=edit_message)
+async def render_flow(bot: Bot, chat_id: int, user_id: int, edit_message: Optional[Message] = None) -> None:
+    user=await get_user(user_id)
+    if user is None: return
+    if user["banned"] and not is_admin(user_id): return
+    if user["restricted"] and not is_admin(user_id):
+        await delete_previous_flow(bot,user_id,chat_id); await render_contact_admin(bot,chat_id); return
+    if await get_setting("maintenance_mode","0")=="1" and not is_admin(user_id):
+        await delete_previous_flow(bot,user_id,chat_id); msg=await bot.send_message(chat_id,await get_setting("maintenance_message","🛠 Maintenance")); await set_flow_message(user_id,chat_id,msg.message_id,"maintenance"); return
+    if is_admin(user_id): return await render_main_menu(bot,chat_id,user_id,edit_message=edit_message)
+    step=await next_step(user)
+    if step==STEP_GATE: await render_gate(bot,chat_id,edit_message=edit_message)
+    elif step==STEP_CAPTCHA: await render_captcha(bot,chat_id,user_id,edit_message=edit_message)
+    elif step==STEP_PHONE: await render_phone(bot,chat_id,user_id,edit_message=edit_message)
+    else: await render_main_menu(bot,chat_id,user_id,edit_message=edit_message)
 
 
 async def show_channels_list(message: Message) -> None:
@@ -2529,6 +2286,7 @@ async def send_channels_list(message: Message) -> None:
 class AdminStates(StatesGroup):
     waiting_reward_caption = State()
     waiting_required_referrals = State()
+    waiting_reward_rules = State()
     waiting_channel_forward = State()
     waiting_channel_link = State()
     waiting_broadcast = State()
@@ -2539,7 +2297,6 @@ class AdminStates(StatesGroup):
     waiting_banner_photo = State()
     waiting_ui_message = State()
     waiting_ui_button = State()
-    waiting_ui_preview_user = State()
     waiting_v3_user_search = State()
     waiting_v3_audit_filter = State()
     waiting_v3_role_admin = State()
@@ -2556,58 +2313,31 @@ class AdminStates(StatesGroup):
 # User-facing router
 # ---------------------------------------------------------------------------
 
-async def render_admin_dashboard(bot: Bot, chat_id: int, admin_id: int, edit_message: Optional[Message] = None) -> None:
-    admin = await bot.get_chat(admin_id)
-    admin_name = admin.first_name or admin.username or "Admin"
-    text = await ui_message("admin_panel", admin_name=admin_name)
-    kb = await admin_panel_keyboard(admin_id)
-    if edit_message:
-        try:
-            await edit_message.edit_text(text, reply_markup=kb)
-            return
-        except Exception:
-            pass
-    await bot.send_message(chat_id, text, reply_markup=kb)
-
 user_router = Router(name="user")
 
 
 @user_router.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject, bot: Bot) -> None:
-    user_id = message.from_user.id
-    if rate_limited(user_id, "start", 0.8):
-        return
-    username = message.from_user.username
-    first_name = message.from_user.first_name or ""
-    last_name = message.from_user.last_name or ""
-    user = await get_user(user_id)
+    user_id=message.from_user.id; username=message.from_user.username; first_name=message.from_user.first_name or ""
+    user=await get_user(user_id)
     if user is None:
-        referred_by = None
-        payload = (command.args or "").strip()
-        if payload.isdigit():
-            candidate_id = int(payload)
-            if candidate_id != user_id:
-                candidate = await get_user(candidate_id)
-                if candidate is not None and not candidate["banned"] and not candidate["restricted"]:
-                    referred_by = candidate_id
-        await create_user(user_id, username, first_name, referred_by, last_name)
-        user = await get_user(user_id)
-    else:
-        await update_user_profile(user_id, username, first_name, last_name)
-
-    if user["banned"] and not await is_effective_admin_async(user_id):
-        await message.answer("🚫 You are banned from using this bot.")
-        return
-    if user["restricted"] and not await is_effective_admin_async(user_id):
-        await render_contact_admin(bot, message.chat.id)
-        return
-    if await is_effective_admin_async(user_id):
-        admin_name = first_name or username or "Admin"
-        await _delete_active_flow_message(bot, user_id)
-        await message.answer(await ui_message("start_admin", admin_name=admin_name))
-        await render_admin_dashboard(bot, message.chat.id, user_id)
-        return
-    await render_flow(bot, message.chat.id, user_id)
+        referred_by=None; payload=(command.args or "").strip()
+        if payload:
+            try: candidate_id=int(payload)
+            except ValueError: candidate_id=None
+            if candidate_id and candidate_id!=user_id:
+                candidate=await get_user(candidate_id)
+                if candidate and not candidate["banned"] and not candidate["restricted"]: referred_by=candidate_id
+        await create_user(user_id,username,first_name,referred_by); user=await get_user(user_id)
+    else: await update_user_profile(user_id,username,first_name)
+    if user["banned"] and not is_admin(user_id): return
+    if user["restricted"] and not is_admin(user_id): await render_contact_admin(bot,message.chat.id); return
+    if is_admin(user_id):
+        ctx=await user_context(user_id,bot); admin_name=ctx.get("first_name") or ctx.get("username") or "Admin"
+        try: await message.answer(await ui_message("start_admin",admin_name=admin_name))
+        except Exception: pass
+        await render_main_menu(bot,message.chat.id,user_id); return
+    await render_flow(bot,message.chat.id,user_id)
 
 
 @user_router.message(Command("help"))
@@ -2620,9 +2350,6 @@ async def cmd_help(message: Message) -> None:
 @user_router.callback_query(F.data.startswith("cap:"))
 async def cb_captcha(callback: CallbackQuery, bot: Bot) -> None:
     user_id = callback.from_user.id
-    if rate_limited(user_id, "captcha", 0.5):
-        await callback.answer("Please wait a moment.")
-        return
     user = await get_user(user_id)
     if user is None:
         await callback.answer("Please send /start first.", show_alert=True)
@@ -2637,13 +2364,9 @@ async def cb_captcha(callback: CallbackQuery, bot: Bot) -> None:
     chosen = callback.data.split(":", 1)[1]
     if user["captcha_answer"] and chosen == user["captcha_answer"]:
         await mark_captcha_passed(user_id)
-        try:
-            await callback.message.edit_text("✅ <b>Verified — you're human!</b>")
-        except TelegramBadRequest:
-            pass
         await callback.answer("✅ Correct!")
         await maybe_credit_referral(user_id, bot)
-        await render_flow(bot, callback.message.chat.id, user_id)
+        await render_flow(bot, callback.message.chat.id, user_id, edit_message=callback.message)
     else:
         await callback.answer("❌ Wrong answer — try again!", show_alert=True)
         await render_captcha(bot, callback.message.chat.id, user_id, edit_message=callback.message)
@@ -2658,7 +2381,7 @@ async def on_contact(message: Message, bot: Bot) -> None:
     if user is None:
         await message.answer("Please send /start first.")
         return
-    if (user["banned"] or user["restricted"]) and not await is_effective_admin_async(user_id):
+    if (user["banned"] or user["restricted"]) and not is_admin(user_id):
         return
     if await get_setting("phone_verify_enabled", "1") != "1" or user["phone_verified"]:
         return
@@ -2701,9 +2424,8 @@ async def on_contact(message: Message, bot: Bot) -> None:
         return
 
     await set_phone_verified(user_id, canonical)
-    await _delete_active_flow_message(bot, user_id)
-    await message.answer("✅ <b>Phone verified successfully!</b>", reply_markup=ReplyKeyboardRemove())
     await maybe_credit_referral(user_id, bot)
+    await delete_previous_flow(bot,user_id,message.chat.id)
     await render_flow(bot, message.chat.id, user_id)
 
 
@@ -2833,171 +2555,96 @@ async def _notify_membership_verified(bot: Bot, user_id: int) -> None:
 
 @user_router.callback_query(F.data == "gate_check")
 async def cb_gate_check(callback: CallbackQuery, bot: Bot) -> None:
-    user_id = callback.from_user.id
-    user = await get_user(user_id)
-    if user is None:
-        await callback.answer("Please send /start first.", show_alert=True)
-        return
-    if user["banned"] or user["restricted"]:
-        await callback.answer("Access restricted.", show_alert=True)
-        return
-    result = await _evaluate_required_channels(bot, user_id)
+    user_id=callback.from_user.id; user=await get_user(user_id)
+    if user is None: await callback.answer("Please send /start first.",show_alert=True); return
+    if user["banned"] or user["restricted"]: await callback.answer("Access restricted.",show_alert=True); return
+    result=await _evaluate_required_channels(bot,user_id)
     if result["all_member"]:
-        await mark_joined_gate(user_id)
-        await maybe_credit_referral(user_id, bot)
-        await callback.answer()
-        await render_flow(bot, user_id, user_id, edit_message=callback.message)
-    else:
-        await callback.answer()
-        await render_gate(bot, user_id, edit_message=callback.message)
+        await mark_joined_gate(user_id); await maybe_credit_referral(user_id,bot); await callback.answer("✅"); await render_flow(bot,callback.message.chat.id,user_id,edit_message=callback.message); return
+    await callback.answer("Please join all required channels.")
+    await render_gate(bot,callback.message.chat.id,edit_message=callback.message)
 
 
 @user_router.chat_join_request()
 async def on_chat_join_request(update: ChatJoinRequest, bot: Bot) -> None:
-    user_id = update.from_user.id
-    channel_id = update.chat.id
-    channels = await get_channels()
-    if channel_id not in {ch["channel_id"] for ch in channels}:
-        return
-    user = await get_user(user_id)
-    if user is None or user["banned"] or user["restricted"] or is_effective_admin(user_id):
-        return
-    await record_join_request(user_id, channel_id)
-    await set_join_request_status(user_id, channel_id, "PENDING_APPROVAL")
-    await set_setting("join_last_event_at", datetime.now(timezone.utc).strftime("%H:%M:%S"))
-    if await get_setting("auto_approve_join_requests", "0") != "1":
-        # Silent mode: the join request is persisted and no user-facing message is sent.
-        logger.info("Join request recorded silently: user=%s channel=%s", user_id, channel_id)
-        return
+    user_id=update.from_user.id; channel_id=update.chat.id
+    channels=await get_channels()
+    if channel_id not in {c["channel_id"] for c in channels}: return
+    user=await get_user(user_id)
+    if not user or user["banned"] or user["restricted"] or is_admin(user_id): return
+    await record_join_request(user_id,channel_id); await set_join_request_status(user_id,channel_id,"PENDING_APPROVAL")
+    await set_setting("join_last_event_at",datetime.now(timezone.utc).strftime("%H:%M:%S"))
+    auto=await get_setting("auto_approve_join_requests","0")=="1"
+    if not auto:
+        logger.info("Join request silently stored: user=%s channel=%s",user_id,channel_id); return
     try:
-        await bot.approve_chat_join_request(chat_id=channel_id, user_id=user_id)
-        await mark_join_approved(user_id, channel_id)
+        await bot.approve_chat_join_request(chat_id=channel_id,user_id=user_id); await mark_join_approved(user_id,channel_id)
+        # Approval is not membership. Verification is completed only after a fresh get_chat_member/member update.
+        for _ in range(6):
+            membership,_=await _member_is_verified(bot,user_id,channel_id)
+            if membership=="MEMBER":
+                await mark_join_member(user_id,channel_id); break
+            await asyncio.sleep(1)
+        result=await _evaluate_required_channels(bot,user_id)
+        if result["all_member"]:
+            await mark_joined_gate(user_id); await maybe_credit_referral(user_id,bot); await render_flow(bot,user_id,user_id)
     except Exception as exc:
-        await mark_join_error(user_id, channel_id, type(exc).__name__)
-        logger.exception("Auto-approval failed for user %s channel %s", user_id, channel_id)
-        return
-    # Approval is not membership. Verify with fresh get_chat_member(), retrying briefly.
-    for _ in range(6):
-        membership, _ = await _member_is_verified(bot, user_id, channel_id)
-        if membership == "MEMBER":
-            await mark_join_member(user_id, channel_id)
-            break
-        await asyncio.sleep(1)
-    result = await _evaluate_required_channels(bot, user_id)
-    if result["all_member"]:
-        await mark_joined_gate(user_id)
-        await maybe_credit_referral(user_id, bot)
-        await render_flow(bot, user_id, user_id)
+        await mark_join_error(user_id,channel_id,type(exc).__name__)
+        logger.exception("Auto approval failed for user=%s channel=%s",user_id,channel_id)
+
 
 @user_router.chat_member()
 async def on_chat_member_update(event: ChatMemberUpdated, bot: Bot) -> None:
-    channels = await get_channels()
-    if event.chat.id not in {ch["channel_id"] for ch in channels}:
-        return
-    user_id = event.new_chat_member.user.id
-    if await is_effective_admin_async(user_id):
-        return
-    status = event.new_chat_member.status
-    if status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR) or (
-        status == ChatMemberStatus.RESTRICTED and bool(getattr(event.new_chat_member, "is_member", False))
-    ):
-        await mark_join_member(user_id, event.chat.id)
-        result = await _evaluate_required_channels(bot, user_id)
+    channels=await get_channels()
+    if event.chat.id not in {c["channel_id"] for c in channels}: return
+    user_id=event.new_chat_member.user.id
+    if is_admin(user_id): return
+    status=event.new_chat_member.status
+    if status in (ChatMemberStatus.MEMBER,ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.CREATOR) or (status==ChatMemberStatus.RESTRICTED and bool(getattr(event.new_chat_member,"is_member",False))):
+        await mark_join_member(user_id,event.chat.id); result=await _evaluate_required_channels(bot,user_id)
         if result["all_member"]:
-            await mark_joined_gate(user_id)
-            await maybe_credit_referral(user_id, bot)
-            # Seamlessly advance the existing flow message to CAPTCHA/phone/dashboard.
-            await render_flow(bot, user_id, user_id)
+            await mark_joined_gate(user_id); await maybe_credit_referral(user_id,bot)
+            flow=await get_flow_message(user_id); await render_flow(bot,user_id,user_id,edit_message=None if not flow else await _safe_get_message(bot,flow["chat_id"],flow["message_id"]))
         return
-    await set_join_request_status(user_id, event.chat.id, "KICKED" if status == ChatMemberStatus.KICKED else "LEFT")
-    await unmark_joined_gate(user_id)
+    await set_join_request_status(user_id,event.chat.id,"KICKED" if status==ChatMemberStatus.KICKED else "LEFT"); await unmark_joined_gate(user_id)
+
+async def _safe_get_message(bot:Bot,chat_id:int,message_id:int):
+    # Telegram has no get_message API. Return None; the renderer will replace the tracked message safely.
+    return None
 
 
 # --- Main menu (NO leaderboard for users) -----------------------------------
 
 @user_router.callback_query(F.data == "menu_link")
 async def cb_referral_link(callback: CallbackQuery, bot: Bot) -> None:
-    user = await get_user(callback.from_user.id)
-    if user is None:
-        await callback.answer(await ui_message("no_user"), show_alert=True)
-        return
-    me = await bot.get_me()
-    link = f"https://t.me/{me.username}?start={callback.from_user.id}" if me.username else ""
-    required = await get_required_referrals()
-    reward_text = await get_setting("reward_caption", "Agent Number")
-    text = await ui_message(
-        "referral_link",
-        link=link,
-        count=user["referral_count"],
-        required=required,
-        reward=safe_html(reward_text),
-        bot_name=await _bot_display_name(bot),
-    )
-    share_caption = await ui_message("share_caption", bot_name=await _bot_display_name(bot))
-    share_url = f"https://t.me/share/url?url={quote(link, safe='')}&text={quote(share_caption, safe='')}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=await ui_button("share_friend", "📤 SHARE"), url=share_url)],
-        [InlineKeyboardButton(text=await ui_button("back", "⬅️ BACK"), callback_data="menu_back")],
-    ])
-    try:
-        await callback.message.edit_text(text, reply_markup=kb)
-    except TelegramBadRequest:
-        await callback.message.answer(text, reply_markup=kb)
+    user_id=callback.from_user.id; user=await get_user(user_id)
+    if not user: await callback.answer("Please send /start first.",show_alert=True); return
+    me=await bot.get_me(); link=f"https://t.me/{me.username}?start={user_id}" if me.username else ""
+    required=await get_required_referrals(); count=user["referral_count"]
+    text=await ui_message("referral_link",link=link,referrals=count,required_referrals=required,reward=f"{await get_setting('reward_quantity','1')} Agent Number")
+    share=f"https://t.me/share/url?url={quote(link,safe='')}&text={quote(await ui_message('share_caption'),safe='')}"
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=await ui_button("share_friend","📤 SHARE LINK"),url=share)],[InlineKeyboardButton(text=await ui_button("back","⬅️ Back"),callback_data="menu_back")]])
+    try: await callback.message.edit_text(text,reply_markup=kb)
+    except TelegramBadRequest: pass
     await callback.answer()
 
+
 @user_router.callback_query(F.data == "menu_stats")
-async def cb_my_stats(callback: CallbackQuery, bot: Bot) -> None:
-    user = await get_user(callback.from_user.id)
-    if user is None:
-        await callback.answer(await ui_message("no_user"), show_alert=True)
-        return
-    required = await get_required_referrals()
-    latest = await _latest_active_reward(user["user_id"])
-    latest_text = pretty_number(latest["reward_number"]) if latest else "🔒 Locked"
-    text = await ui_message(
-        "stats",
-        count=user["referral_count"],
-        successful=user["referral_count"],
-        required=required,
-        reward_count=await _reward_count(user["user_id"]),
-        phone="Verified" if user["phone_verified"] else "Not verified",
-        verification="Complete" if await all_verifications_passed(user) else "Incomplete",
-        latest_reward=latest_text,
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=await ui_button("my_reward", "🎁 MY REWARD"), callback_data="my_reward")],
-        [InlineKeyboardButton(text=await ui_button("referral_link", "🔗 REFER & EARN"), callback_data="menu_link"),
-         InlineKeyboardButton(text=await ui_button("back", "⬅️ BACK"), callback_data="menu_back")],
-    ])
-    try:
-        await callback.message.edit_text(text, reply_markup=kb)
-    except TelegramBadRequest:
-        pass
-    await callback.answer()
+async def cb_my_stats(callback: CallbackQuery) -> None:
+    user=await get_user(callback.from_user.id)
+    if not user: await callback.answer(await ui_message("no_user"),show_alert=True); return
+    required=await get_required_referrals(); latest=await latest_reward(user["user_id"]); rc=await reward_count(user["user_id"])
+    text=await ui_message("stats",progress=progress_bar(user["referral_count"],required),count=user["referral_count"],required=required,reward_count=rc,phone="Verified" if user["phone_verified"] else "Not verified",access="Verified" if user["joined_gate"] else "Pending",latest_reward=pretty_number(latest["reward_number"]) if latest else "—")
+    await callback.message.edit_text(text,reply_markup=await back_keyboard("menu_back")); await callback.answer()
+
 
 @user_router.callback_query(F.data == "my_reward")
 async def cb_my_reward(callback: CallbackQuery, bot: Bot) -> None:
-    if rate_limited(callback.from_user.id, "reward_recovery", 1.0):
-        await callback.answer("Please wait a moment.")
-        return
-    user = await get_user(callback.from_user.id)
-    if user is None:
-        await callback.answer(await ui_message("no_user"), show_alert=True)
-        return
-    if user["banned"] or user["restricted"]:
-        await callback.answer("Access restricted.", show_alert=True)
-        return
-    reward = await _latest_active_reward(user["user_id"])
-    if not reward:
-        await callback.answer("No reward available.", show_alert=True)
-        try:
-            await callback.message.edit_text(await ui_message("no_reward"), reply_markup=await back_keyboard("menu_back"))
-        except Exception:
-            pass
-        return
-    await _send_reward_record(bot, reward, recovery=True)
-    await callback.answer("🎁 Reward recovered.")
-
+    user_id=callback.from_user.id; user=await get_user(user_id)
+    if not user or user["banned"] or user["restricted"]:
+        await callback.answer("Access restricted.",show_alert=True); return
+    ok=await recover_reward(bot,user_id)
+    await callback.answer("🎁 Reward recovered." if ok else "No active reward found.",show_alert=not ok)
 
 @user_router.callback_query(F.data == "menu_back")
 async def cb_menu_back(callback: CallbackQuery, bot: Bot) -> None:
@@ -3008,6 +2655,19 @@ async def cb_menu_back(callback: CallbackQuery, bot: Bot) -> None:
 # ---------------------------------------------------------------------------
 # Admin router
 # ---------------------------------------------------------------------------
+
+async def admin_context(admin_id:int, bot:Bot|None=None)->dict:
+    first=last=username=""
+    row=await get_user(admin_id)
+    if row:
+        first=row["first_name"] or ""; username=row["username"] or ""
+    if bot and not first:
+        try:
+            me=await bot.get_chat(admin_id); first=me.first_name or ""; last=me.last_name or ""; username=me.username or username
+        except Exception: pass
+    name=first or (" ".join(x for x in [first,last] if x)) or (f"@{username}" if username else "Admin")
+    return {"admin_name":name,"admin_first_name":first or name,"admin_last_name":last,"admin_username":f"@{username}" if username else "","admin_id":admin_id}
+
 
 admin_router = Router(name="admin")
 admin_router.callback_query.outer_middleware(AdminGuardMiddleware())
@@ -3023,13 +2683,13 @@ async def cmd_admin_cancel(message: Message, state: FSMContext) -> None:
 @admin_router.message(Command("admin"))
 async def cmd_admin(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer(await ui_message("admin_panel"), reply_markup=await admin_panel_keyboard())
+    await message.answer(await ui_message("admin_panel", **(await admin_context(message.from_user.id))), reply_markup=await admin_panel_keyboard(message.from_user.id))
 
 
 @admin_router.callback_query(F.data == "adm_back")
 async def cb_admin_back(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await callback.message.edit_text(await ui_message("admin_panel"), reply_markup=await admin_panel_keyboard(callback.from_user.id))
+    await callback.message.edit_text(await ui_message("admin_panel", **(await admin_context(callback.from_user.id))), reply_markup=await admin_panel_keyboard(callback.from_user.id))
     await callback.answer()
 
 
@@ -3060,101 +2720,51 @@ def _editor_button_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-MESSAGE_VARIABLES = {
-    "admin_name","admin_first_name","admin_last_name","admin_username","admin_id",
-    "user_name","first_name","last_name","username","user_id",
-    "bot_name","bot_username","bot_id","clone_name","clone_id","clone_username",
-    "referrals","referral_count","required_referrals","remaining_referrals","progress","referral_link",
-    "reward","reward_number","reward_count","reward_status","reward_date",
-    "channel_name","channel_username","channel_link","date","time","datetime",
-    "total_users","today_users","total_rewards",
-}
-
-async def build_message_context(bot: Bot, user_id: int | None = None, admin_id: int | None = None) -> dict:
-    now = datetime.now()
-    try:
-        me = await bot.get_me()
-    except Exception:
-        me = None
-    user = await get_user(user_id) if user_id else None
-    admin = await bot.get_chat(admin_id) if admin_id else None
-    required = await get_required_referrals()
-    referrals = int(user["referral_count"]) if user else 0
-    reward = await _latest_active_reward(user_id) if user_id else None
-    return {
-        "admin_name": (admin.first_name if admin else None) or (admin.username if admin else None) or "Admin",
-        "admin_first_name": (admin.first_name if admin else None) or "Admin",
-        "admin_last_name": (admin.last_name if admin else None) or "",
-        "admin_username": (admin.username if admin else None) or "",
-        "admin_id": admin_id or "",
-        "user_name": (user["first_name"] if user else None) or (user["username"] if user else None) or "User",
-        "first_name": (user["first_name"] if user else None) or "User",
-        "last_name": (user["last_name"] if user and "last_name" in user.keys() else "") or "",
-        "username": (user["username"] if user else None) or "",
-        "user_id": user_id or "",
-        "bot_name": await _bot_display_name(bot),
-        "bot_username": me.username if me else "",
-        "bot_id": me.id if me else "",
-        "clone_name": await get_setting("clone_name", ""),
-        "clone_id": CLONE_ID,
-        "clone_username": me.username if me else "",
-        "referrals": referrals,
-        "referral_count": referrals,
-        "required_referrals": required,
-        "remaining_referrals": max(0, required-referrals),
-        "progress": progress_bar(referrals, required),
-        "referral_link": f"https://t.me/{me.username}?start={user_id}" if me and me.username and user_id else "",
-        "reward": pretty_number(reward["reward_number"]) if reward else "Locked",
-        "reward_number": pretty_number(reward["reward_number"]) if reward else "",
-        "reward_count": await _reward_count(user_id) if user_id else 0,
-        "reward_status": reward["reward_status"] if reward else "LOCKED",
-        "reward_date": (reward["delivered_at"] or reward["created_at"])[:10] if reward else "",
-        "channel_name": "",
-        "channel_username": "",
-        "channel_link": "",
-        "date": now.strftime("%Y-%m-%d"),
-        "time": now.strftime("%H:%M:%S"),
-        "datetime": now.strftime("%Y-%m-%d %H:%M:%S"),
-        "total_users": (await get_stats())["total_users"],
-        "today_users": (await get_stats())["today_users"],
-        "total_rewards": await _reward_count(user_id) if user_id else 0,
-    }
-
 @admin_router.callback_query(F.data == "adm_editor")
 async def cb_editor_home(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.message.edit_text(
         "✏️ <b>Message & Button Studio</b>\n\n"
         "✨ Edit the text shown throughout the bot.\n"
-        "🧩 Variables are rendered safely and dynamic values are HTML-escaped.\n"
-        "👁 Preview uses the current admin/user context.\n"
+        "💎 Premium/custom emoji are preserved in messages when you send them from Telegram.\n"
+        "🔘 Button labels can be customized with normal Unicode emoji. Telegram Bot API does not support premium/custom-emoji entities inside button text.\n\n"
         "Choose what you want to edit:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📝 Edit Messages", callback_data="ce_messages")],
             [InlineKeyboardButton(text="🔘 Edit Buttons", callback_data="ce_buttons")],
             [InlineKeyboardButton(text="🎨 UI Theme", callback_data="ui_theme")],
-            [InlineKeyboardButton(text="🧩 Variables", callback_data="ui_variables"),
-             InlineKeyboardButton(text="👁 Preview", callback_data="ui_preview_gate")],
+            [InlineKeyboardButton(text="👁 Preview", callback_data="ui_preview_gate"), InlineKeyboardButton(text="🧩 Variables", callback_data="ui_variables")],
+            [InlineKeyboardButton(text="📜 Version History", callback_data="ui_history:gate")],
             [InlineKeyboardButton(text="⬅️ Back", callback_data="adm_back")],
         ])
     )
     await callback.answer()
 
+
 @admin_router.callback_query(F.data == "ui_variables")
 async def cb_ui_variables(callback: CallbackQuery) -> None:
-    rows = []
-    keys = sorted(MESSAGE_VARIABLES)
-    for i in range(0, len(keys), 2):
-        chunk = keys[i:i+2]
-        rows.append([InlineKeyboardButton(text="{" + k + "}", callback_data="noop") for k in chunk])
-    rows.append([InlineKeyboardButton(text="⬅️ BACK", callback_data="adm_editor")])
-    await callback.message.edit_text("🧩 <b>AVAILABLE VARIABLES</b>\n\n" + "\n".join(f"• <code>{{{k}}}</code>" for k in keys), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    await callback.answer()
+    text=("🧩 <b>VARIABLES</b>\n\n<b>ADMIN</b>\n<code>{admin_name}</code> <code>{admin_username}</code> <code>{admin_id}</code>\n\n<b>USER</b>\n<code>{first_name}</code> <code>{username}</code> <code>{user_id}</code>\n\n<b>BOT</b>\n<code>{bot_name}</code> <code>{bot_username}</code>\n\n<b>REFERRAL</b>\n<code>{referrals}</code> <code>{required_referrals}</code> <code>{remaining_referrals}</code> <code>{referral_link}</code> <code>{progress}</code>\n\n<b>REWARD</b>\n<code>{reward_number}</code> <code>{reward_status}</code> <code>{reward_date}</code>\n\n<b>SYSTEM</b>\n<code>{total_users}</code> <code>{today_users}</code> <code>{total_rewards}</code> <code>{available_rewards}</code> <code>{datetime}</code>")
+    await callback.message.edit_text(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Back",callback_data="adm_editor")]])); await callback.answer()
 
-@admin_router.callback_query(F.data == "noop")
-async def cb_noop(callback: CallbackQuery) -> None:
-    await callback.answer("Copy the variable shown above.", show_alert=True)
+@admin_router.callback_query(F.data.startswith("ui_history:"))
+async def cb_ui_history(callback: CallbackQuery) -> None:
+    key=callback.data.split(":",1)[1]
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory=aiosqlite.Row; cur=await db.execute("SELECT * FROM message_versions WHERE message_key=? ORDER BY version DESC LIMIT 10",(key,)); rows=list(await cur.fetchall())
+    text=f"📜 <b>VERSION HISTORY — {hesc(key)}</b>\n\n"+"\n".join(f"v{r['version']} · {r['created_at'][:19]} · <code>{r['created_by'] or 'system'}</code>" for r in rows) if rows else "No versions yet."
+    buttons=[[InlineKeyboardButton(text=f"↩️ Restore v{r['version']}",callback_data=f"ui_restore:{key}:{r['version']}")] for r in rows]
+    buttons.append([InlineKeyboardButton(text="⬅️ Back",callback_data="adm_editor")])
+    await callback.message.edit_text(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)); await callback.answer()
 
+@admin_router.callback_query(F.data.startswith("ui_restore:"))
+async def cb_ui_restore(callback: CallbackQuery) -> None:
+    _,key,raw=callback.data.split(":",2); version=int(raw)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur=await db.execute("SELECT content FROM message_versions WHERE message_key=? AND version=?",(key,version)); row=await cur.fetchone()
+    if not row: await callback.answer("Version not found.",show_alert=True); return
+    try: await save_ui_message(key,row[0],callback.from_user.id)
+    except ValueError as exc: await callback.answer(str(exc)[:180],show_alert=True); return
+    await audit(callback.from_user.id,"RESTORE_MESSAGE",details=f"{key}:v{version}"); await callback.answer(f"✅ Restored v{version}"); await cb_ui_history(callback)
 
 @admin_router.callback_query(F.data == "ui_theme")
 async def cb_ui_theme(callback: CallbackQuery) -> None:
@@ -3215,7 +2825,7 @@ async def cb_choose_message(callback: CallbackQuery, state: FSMContext) -> None:
     if key not in UI_MESSAGES:
         await callback.answer("Unknown message.", show_alert=True)
         return
-    current = await ui_message(key)
+    current = await ui_message(key, **(await user_context(callback.from_user.id)))
     await state.update_data(ui_key=key)
     await state.set_state(AdminStates.waiting_ui_message)
     await callback.message.edit_text(
@@ -3223,111 +2833,13 @@ async def cb_choose_message(callback: CallbackQuery, state: FSMContext) -> None:
         f"<b>Current preview:</b>\n\n{current}\n\n"
         "Send the new message now. You can use HTML formatting and Telegram premium/custom emoji.\n"
         "Use /cancel to leave without changing it.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👁 PREVIEW", callback_data=f"ce_preview:{key}"),
-             InlineKeyboardButton(text="👤 PREVIEW AS USER", callback_data=f"ce_preview_user:{key}")],
-            [InlineKeyboardButton(text="🕘 HISTORY", callback_data=f"ce_versions:{key}"),
-             InlineKeyboardButton(text="🔄 RESET", callback_data=f"ce_reset:{key}")],
-            [InlineKeyboardButton(text="⬅️ BACK", callback_data="ce_messages")],
-        ])
+        reply_markup=await cancel_keyboard("ce_messages")
     )
     await callback.answer()
 
-
-@admin_router.callback_query(F.data.startswith("ce_versions:"))
-async def cb_message_versions(callback: CallbackQuery) -> None:
-    key = callback.data.split(":",1)[1]
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory=aiosqlite.Row
-        cur = await db.execute("SELECT id,admin_id,created_at FROM message_versions WHERE message_key=? ORDER BY id DESC LIMIT 10",(key,))
-        rows=list(await cur.fetchall())
-    text="🕘 <b>MESSAGE HISTORY</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
-    text += "\n".join(f"#{r['id']} · admin <code>{r['admin_id']}</code> · {r['created_at'][:19]}" for r in rows) or "No saved versions yet."
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ EDIT", callback_data=f"ce_m:{key}")],
-        [InlineKeyboardButton(text="⬅️ BACK", callback_data="ce_messages")],
-    ]))
-    await callback.answer()
-
-@admin_router.callback_query(F.data.startswith("ce_reset:"))
-async def cb_message_reset(callback: CallbackQuery) -> None:
-    key=callback.data.split(":",1)[1]
-    if key not in UI_MESSAGES:
-        await callback.answer("Unknown message.", show_alert=True); return
-    await callback.message.edit_text(
-        f"⚠️ <b>RESET MESSAGE?</b>\n\nOnly <code>{hesc(key)}</code> will be restored to the built-in default.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⚠️ CONFIRM", callback_data=f"ce_reset_confirm:{key}")],
-            [InlineKeyboardButton(text="❌ CANCEL", callback_data=f"ce_m:{key}")],
-        ]),
-    )
-    await callback.answer()
-
-@admin_router.callback_query(F.data.startswith("ce_reset_confirm:"))
-async def cb_message_reset_confirm(callback: CallbackQuery) -> None:
-    key=callback.data.split(":",1)[1]
-    if key not in UI_MESSAGES:
-        await callback.answer("Unknown message.", show_alert=True); return
-    old=await ui_message(key)
-    await save_ui_message(key, UI_MESSAGES[key])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO message_versions(message_key,admin_id,value,created_at) VALUES(?,?,?,?)",
-                         (key,callback.from_user.id,UI_MESSAGES[key],datetime.now(timezone.utc).isoformat()))
-        await db.commit()
-    await audit(callback.from_user.id,"RESET_MESSAGE",details=key,before=old,after=UI_MESSAGES[key])
-    await callback.answer("✅ Reset.")
-    await callback.message.edit_text(
-        f"📝 <b>{hesc(key.replace('_',' ').title())}</b>\n\n{UI_MESSAGES[key]}",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👁 PREVIEW", callback_data=f"ce_preview:{key}")],
-            [InlineKeyboardButton(text="⬅️ BACK", callback_data="ce_messages")],
-        ]),
-    )
-
-@admin_router.callback_query(F.data.startswith("ce_preview:"))
-async def cb_message_preview(callback: CallbackQuery, bot: Bot, state: FSMContext) -> None:
-    key = callback.data.split(":",1)[1]
-    if key not in UI_MESSAGES:
-        await callback.answer("Unknown message.", show_alert=True); return
-    template = await get_setting(f"ui_msg:{key}", UI_MESSAGES[key])
-    context = await build_message_context(bot, user_id=callback.from_user.id, admin_id=callback.from_user.id)
-    rendered = _render_template(template, context)
-    await callback.message.answer("👁 <b>LIVE PREVIEW</b>\n━━━━━━━━━━━━━━━━━━━━\n\n" + rendered)
-    await callback.answer("Preview sent.")
-
-@admin_router.callback_query(F.data.startswith("ce_preview_user:"))
-async def cb_message_preview_user(callback: CallbackQuery, state: FSMContext) -> None:
-    key = callback.data.split(":",1)[1]
-    if key not in UI_MESSAGES:
-        await callback.answer("Unknown message.", show_alert=True); return
-    await state.update_data(ui_key=key)
-    await state.set_state(AdminStates.waiting_ui_preview_user)
-    await callback.message.edit_text(
-        "👤 <b>PREVIEW AS USER</b>\n\nSend the Telegram User ID to render this message with that user's context.",
-        reply_markup=await cancel_keyboard(f"ce_m:{key}"),
-    )
-    await callback.answer()
-
-@admin_router.message(AdminStates.waiting_ui_preview_user)
-async def process_ui_preview_user(message: Message, state: FSMContext, bot: Bot) -> None:
-    data = await state.get_data()
-    key = data.get("ui_key")
-    raw = (message.text or "").strip()
-    if not raw.isdigit():
-        await message.answer("❌ Send a numeric Telegram User ID.")
-        return
-    user_id = int(raw)
-    if await get_user(user_id) is None:
-        await message.answer("❌ User not found in this clone.")
-        return
-    template = await get_setting(f"ui_msg:{key}", UI_MESSAGES.get(key,key))
-    context = await build_message_context(bot, user_id=user_id, admin_id=message.from_user.id)
-    rendered = _render_template(template, context)
-    await state.clear()
-    await message.answer("👤 <b>USER PREVIEW</b>\n━━━━━━━━━━━━━━━━━━━━\n\n" + rendered, reply_markup=await admin_panel_keyboard(message.from_user.id))
 
 @admin_router.message(AdminStates.waiting_ui_message)
-async def process_ui_message(message: Message, state: FSMContext, bot: Bot) -> None:
+async def process_ui_message(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     key = data.get("ui_key")
     if not key or key not in UI_MESSAGES:
@@ -3336,22 +2848,14 @@ async def process_ui_message(message: Message, state: FSMContext, bot: Bot) -> N
         return
     value = message.html_text if message.text else (message.caption or "")
     if not value.strip():
-        await message.answer("❌ Send a text message or caption.")
+        await message.answer("❌ Send a text message (or a photo with caption) to save it.")
         return
-    unknown = _unknown_template_variables(value, MESSAGE_VARIABLES)
-    if unknown:
-        await message.answer("⚠️ Unknown variable(s): " + ", ".join(unknown) + "\n\nRemove them and send again.")
+    old_value=await get_setting(f"ui_msg:{key}",UI_MESSAGES.get(key,""))
+    try:
+        await save_ui_message(key, value, message.from_user.id)
+    except ValueError as exc:
+        await message.answer(f"⚠️ <b>Template rejected</b>\n\n<code>{hesc(str(exc))}</code>")
         return
-    ok, tags = _validate_template_html(value)
-    if not ok:
-        await message.answer("⚠️ Unsupported HTML tag(s): " + ", ".join(tags) + "\n\nUse Telegram-supported HTML only.")
-        return
-    old_value = await ui_message(key)
-    await save_ui_message(key, value)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO message_versions(message_key,admin_id,value,created_at) VALUES(?,?,?,?)",
-                         (key,message.from_user.id,value,datetime.now(timezone.utc).isoformat()))
-        await db.commit()
     await audit(message.from_user.id,"CHANGE_MESSAGE",details=key,before=old_value,after=value)
     await state.clear()
     await message.answer(await ui_message("message_saved"), reply_markup=await admin_panel_keyboard(message.from_user.id))
@@ -3386,10 +2890,6 @@ async def process_ui_button(message: Message, state: FSMContext) -> None:
         return
     if not value:
         await message.answer("❌ Send a button label.")
-        return
-    value = re.sub(r"<[^>]+>", "", value).strip()
-    if not value:
-        await message.answer("❌ Button label cannot be empty.")
         return
     old_value=await ui_button(key)
     await save_ui_button(key, value)
@@ -3510,6 +3010,32 @@ async def process_reward_caption(message: Message, state: FSMContext) -> None:
     await message.answer("✅ Reward caption updated.", reply_markup=await admin_panel_keyboard())
 
 
+# --- Reward rules ------------------------------------------------------------
+
+@admin_router.callback_query(F.data == "adm_reward_rules")
+async def cb_admin_reward_rules(callback: CallbackQuery, state: FSMContext) -> None:
+    required=await get_required_referrals(); qty=await get_setting("reward_quantity","1"); limit=await get_setting("reward_limit","0")
+    await state.set_state(AdminStates.waiting_reward_rules)
+    await callback.message.edit_text(
+        "⚙️ <b>REWARD RULES</b>\n\n"
+        f"Required referrals: <b>{required}</b>\nReward quantity: <b>{hesc(qty)}</b> Agent Number(s)\nReward limit: <b>{hesc(limit)}</b> (0 = unlimited)\n\n"
+        "Send: <code>required quantity limit</code>\nExample: <code>5 1 0</code> = 5 referrals → 1 Agent Number.",
+        reply_markup=await cancel_keyboard("adm_back"))
+    await callback.answer()
+
+@admin_router.message(AdminStates.waiting_reward_rules)
+async def process_reward_rules(message: Message, state: FSMContext) -> None:
+    parts=(message.text or "").split()
+    if len(parts)!=3 or not all(p.isdigit() for p in parts):
+        await message.answer("❌ Format: <code>required quantity limit</code>")
+        return
+    required,qty,limit=map(int,parts)
+    if required<1 or qty<1 or limit<0:
+        await message.answer("❌ Required and quantity must be ≥1; limit must be ≥0.")
+        return
+    await set_setting("required_referrals",str(required)); await set_setting("reward_quantity",str(qty)); await set_setting("reward_limit",str(limit))
+    await state.clear(); await message.answer("✅ Reward rules updated.",reply_markup=await admin_panel_keyboard(message.from_user.id))
+
 # --- Required referrals -----------------------------------------------------
 
 @admin_router.callback_query(F.data == "adm_required")
@@ -3594,10 +3120,10 @@ async def cb_admin_banner(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 @admin_router.message(AdminStates.waiting_banner_photo, F.photo)
-async def process_banner_photo(message: Message, state: FSMContext, bot: Bot) -> None:
+async def process_banner_photo(message: Message, state: FSMContext) -> None:
     caption = (message.html_text or message.caption or "").strip()
     if not caption:
-        caption = f"✨ <b>{hesc(await _bot_display_name(bot))}</b>"
+        caption = "✨ <b>{bot_name}</b>"
     await state.update_data(
         banner_file_id=message.photo[-1].file_id,
         banner_caption=caption,
@@ -3626,7 +3152,7 @@ async def process_banner_photo_invalid(message: Message) -> None:
 async def cb_save_banner(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     file_id = data.get("banner_file_id")
-    caption = data.get("banner_caption") or f"✨ <b>{hesc(await _bot_display_name(callback.bot))}</b>"
+    caption = data.get("banner_caption") or "✨ <b>{bot_name}</b>"
     if not file_id:
         await callback.answer("Send the photo first.", show_alert=True)
         return
@@ -3671,7 +3197,7 @@ async def cb_banner_preview(callback: CallbackQuery) -> None:
     if not file_id:
         await callback.answer("No banner saved for this mode.", show_alert=True)
         return
-    await callback.message.answer_photo(file_id, caption=(caption or f"✨ <b>{hesc(await _bot_display_name(callback.bot))}</b>")[:1024])
+    await callback.message.answer_photo(file_id, caption=(caption or "✨ <b>{bot_name}</b>")[:1024])
     await callback.answer("Preview sent.")
 
 
@@ -4173,67 +3699,6 @@ async def _refresh_user_card(callback: CallbackQuery, user_id: int) -> None:
         pass
 
 
-@admin_router.callback_query(F.data.startswith("usr_rewards:"))
-async def cb_user_rewards(callback: CallbackQuery) -> None:
-    target_id = int(callback.data.split(":", 1)[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM rewards WHERE user_id=? ORDER BY reward_id DESC LIMIT 10", (target_id,))
-        rows = list(await cur.fetchall())
-    if not rows:
-        await callback.answer("No rewards.", show_alert=True)
-        return
-    text = "🎁 <b>REWARD HISTORY</b>\n━━━━━━━━━━━━━━━━━━━━\n\n"
-    for r in rows:
-        text += f"#{r['reward_id']} · <code>{hesc(pretty_number(r['reward_number']))}</code> · <b>{hesc(r['reward_status'])}</b>\n"
-        text += f"📅 {(r['created_at'] or '')[:19].replace('T',' ')} · ♻️ {r['recovery_count']} recoveries\n\n"
-    buttons = []
-    latest = rows[0]
-    if latest["reward_status"] == "DELIVERED":
-        buttons.append([InlineKeyboardButton(text="♻️ RESEND LATEST REWARD", callback_data=f"usr_resend:{target_id}")])
-        buttons.append([InlineKeyboardButton(text="⚠️ REVOKE LATEST", callback_data=f"usr_revoke_confirm:{latest['reward_id']}")])
-    buttons.append([InlineKeyboardButton(text="⬅️ USER", callback_data=f"usr_view:{target_id}")])
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await callback.answer()
-
-@admin_router.callback_query(F.data.startswith("usr_resend:"))
-async def cb_user_resend(callback: CallbackQuery, bot: Bot) -> None:
-    target_id = int(callback.data.split(":", 1)[1])
-    reward = await _latest_active_reward(target_id)
-    if not reward:
-        await callback.answer("No active reward.", show_alert=True)
-        return
-    ok = await _send_reward_record(bot, reward, recovery=True)
-    await audit(callback.from_user.id, "REWARD_RECOVER", target_id, details=f"reward={reward['reward_id']}")
-    await callback.answer("✅ Reward resent." if ok else "❌ Resend failed.", show_alert=not ok)
-
-@admin_router.callback_query(F.data.startswith("usr_revoke_confirm:"))
-async def cb_user_revoke_confirm(callback: CallbackQuery) -> None:
-    reward_id = int(callback.data.split(":", 1)[1])
-    await callback.message.edit_text(
-        "⚠️ <b>REVOKE REWARD?</b>\n\nThis reward will no longer be recoverable by the user.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⚠️ CONFIRM", callback_data=f"usr_revoke:{reward_id}"),
-             InlineKeyboardButton(text="❌ CANCEL", callback_data="adm_back")]
-        ]),
-    )
-    await callback.answer()
-
-@admin_router.callback_query(F.data.startswith("usr_revoke:"))
-async def cb_user_revoke(callback: CallbackQuery) -> None:
-    reward_id = int(callback.data.split(":", 1)[1])
-    ok = await revoke_reward(reward_id, callback.from_user.id)
-    await audit(callback.from_user.id, "REWARD_REVOKE", details=f"reward={reward_id}")
-    await callback.answer("✅ Reward revoked." if ok else "❌ Reward not found.", show_alert=not ok)
-    if ok:
-        await callback.message.edit_text("✅ <b>Reward revoked.</b>", reply_markup=await admin_panel_keyboard(callback.from_user.id))
-
-@admin_router.callback_query(F.data.startswith("usr_view:"))
-async def cb_user_view(callback: CallbackQuery) -> None:
-    target_id = int(callback.data.split(":", 1)[1])
-    await _refresh_user_card(callback, target_id)
-    await callback.answer()
-
 @admin_router.callback_query(F.data.startswith("usr_ban:"))
 async def cb_user_ban(callback: CallbackQuery) -> None:
     target_id = int(callback.data.split(":", 1)[1])
@@ -4282,7 +3747,7 @@ async def cb_user_add_referral(callback: CallbackQuery, bot: Bot) -> None:
     user = await get_user(target_id)
     if user is not None:
         required = await get_required_referrals()
-        if user["referral_count"] >= required:
+        if user["referral_count"] >= required and user["referral_count"] % required == 0:
             await deliver_number_reward(bot, target_id, user["referral_count"])
     await _refresh_user_card(callback, target_id)
     await callback.answer("➕1 referral added.")
@@ -4297,16 +3762,54 @@ async def cb_user_sub_referral(callback: CallbackQuery) -> None:
     await callback.answer("➖1 referral removed.")
 
 
+@admin_router.callback_query(F.data.startswith("usr_rewards:"))
+async def cb_user_rewards(callback: CallbackQuery) -> None:
+    uid=int(callback.data.split(":",1)[1]); rows=await get_reward_records(uid,20)
+    if not rows: await callback.answer("No rewards.",show_alert=True); return
+    buttons=[]
+    for r in rows:
+        status=r["reward_status"]; label=f"#{r['reward_id']} {pretty_number(r['reward_number'] or r['reward_value'] or '')} · {status}"
+        buttons.append([InlineKeyboardButton(text=label[:60],callback_data=f"usr_reward:{uid}:{r['reward_id']}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Back",callback_data="adm_back")])
+    await callback.message.edit_text(f"🎁 <b>REWARD HISTORY</b>\n\nUser: <code>{uid}</code>",reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)); await callback.answer()
+
+@admin_router.callback_query(F.data.startswith("usr_reward:"))
+async def cb_user_reward_detail(callback: CallbackQuery) -> None:
+    _,uid_raw,rid_raw=callback.data.split(":",2); uid=int(uid_raw); rid=int(rid_raw)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory=aiosqlite.Row; cur=await db.execute("SELECT * FROM reward_records WHERE reward_id=? AND user_id=?",(rid,uid)); r=await cur.fetchone()
+    if not r: await callback.answer("Reward not found.",show_alert=True); return
+    text=(f"🎁 <b>Reward #{rid}</b>\n\n<code>{hesc(pretty_number(r['reward_number'] or r['reward_value'] or ''))}</code>\n\nStatus: <b>{hesc(r['reward_status'])}</b>\nCreated: {hesc(r['created_at'])}\nDelivered: {hesc(r['delivered_at'] or '—')}\nRecovery Count: <b>{r['recovery_count']}</b>")
+    rows=[]
+    if r["reward_status"]!="REVOKED": rows.append([InlineKeyboardButton(text="🚫 Revoke Reward",callback_data=f"usr_revoke:{uid}:{rid}")])
+    rows.append([InlineKeyboardButton(text="♻️ Resend",callback_data=f"usr_resend:{uid}:{rid}")]); rows.append([InlineKeyboardButton(text="⬅️ Back",callback_data=f"usr_rewards:{uid}")])
+    await callback.message.edit_text(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)); await callback.answer()
+
+@admin_router.callback_query(F.data.startswith("usr_revoke:"))
+async def cb_user_revoke_reward(callback: CallbackQuery) -> None:
+    if not await can_admin(callback.from_user.id,"rewards"):
+        await callback.answer("⛔ Permission denied.",show_alert=True); return
+    _,uid_raw,rid_raw=callback.data.split(":",2); uid=int(uid_raw); rid=int(rid_raw)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE reward_records SET reward_status='REVOKED' WHERE reward_id=? AND user_id=? AND reward_status!='REVOKED'",(rid,uid)); await db.commit()
+    await _set_flag(uid,"reward_sent",1 if await reward_count(uid) else 0); await audit(callback.from_user.id,"REVOKE_REWARD",uid,details=f"reward_id={rid}")
+    await callback.answer("✅ Reward revoked."); await cb_user_rewards(callback)
+
+@admin_router.callback_query(F.data.startswith("usr_resend:"))
+async def cb_user_resend_reward(callback: CallbackQuery, bot: Bot) -> None:
+    if not await can_admin(callback.from_user.id,"rewards"):
+        await callback.answer("⛔ Permission denied.",show_alert=True); return
+    parts=callback.data.split(":"); uid=int(parts[1]); rid=int(parts[2]) if len(parts)>2 else None
+    ok=await recover_reward(bot,uid,rid); await audit(callback.from_user.id,"RESEND_REWARD",uid,details=f"reward_id={rid or 'latest'}")
+    await callback.answer("✅ Existing reward resent." if ok else "❌ Reward unavailable.",show_alert=not ok)
+
 @admin_router.callback_query(F.data.startswith("usr_reset:"))
 async def cb_user_reset_reward(callback: CallbackQuery) -> None:
     target_id = int(callback.data.split(":", 1)[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET reward_sent=0 WHERE user_id=?", (target_id,))
-        await db.execute("UPDATE rewards SET reward_status='EXPIRED' WHERE user_id=? AND reward_status='DELIVERED'", (target_id,))
-        await db.commit()
-    await audit(callback.from_user.id,"RESET_REWARD",target_id,after="expired")
+    await _set_flag(target_id, "reward_sent", 1 if await reward_count(target_id) else 0)
+    await audit(callback.from_user.id,"RESET_REWARD",target_id,after="preserved")
     await _refresh_user_card(callback, target_id)
-    await callback.answer("🔁 Reward reset.")
+    await callback.answer("🔁 Reward flag reset.")
 
 
 # --- Export users (CSV) -----------------------------------------------------
@@ -4395,7 +3898,7 @@ async def v3_analytics_home(callback: CallbackQuery) -> None:
     a=await v3_analytics(None)
     text=("📈 <b>PREMIUM ANALYTICS</b>\\n━━━━━━━━━━━━━━━━━━━━\\n\\n"
           f"👥 Users: <b>{a['users']}</b>\\n✅ Verification: <b>{a['verified']}</b> ({a['verification_rate']:.1f}%)\\n"
-          f"🤝 Referrals: <b>{a['referrals']}</b> ({a['referral_rate']:.1f}%)\\n🎁 Rewards: <b>{a['rewards']}</b> ({a['reward_rate']:.1f}%)\\n♻️ Recovered: <b>{a['recovered']}</b> · ⚠️ Revoked: <b>{a['revoked']}</b> · ⌛ Expired: <b>{a['expired']}</b>\\n📨 Pending Join Requests: <b>{a['pending_join']}</b>\\n\\n"
+          f"🤝 Referrals: <b>{a['referrals']}</b> ({a['referral_rate']:.1f}%)\\n🎁 Rewards: <b>{a['rewards']}</b> ({a['reward_rate']:.1f}%)\\n\\n"
           "Choose a reporting window:")
     await callback.message.edit_text(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Today",callback_data="v3_an:1"),InlineKeyboardButton(text="7 Days",callback_data="v3_an:7"),InlineKeyboardButton(text="30 Days",callback_data="v3_an:30")],
@@ -4409,7 +3912,7 @@ async def v3_analytics_period(callback: CallbackQuery) -> None:
     label="Today" if days==1 else ("7 Days" if days==7 else ("30 Days" if days==30 else "All Time"))
     text=(f"📈 <b>ANALYTICS — {label}</b>\\n━━━━━━━━━━━━━━━━━━━━\\n\\n"
           f"👥 Users: <b>{a['users']}</b>\\n✅ Verification: <b>{a['verified']}</b> ({a['verification_rate']:.1f}%)\\n"
-          f"🤝 Referrals: <b>{a['referrals']}</b> ({a['referral_rate']:.1f}%)\\n🎁 Rewards: <b>{a['rewards']}</b> ({a['reward_rate']:.1f}%)\\n♻️ Recovered: <b>{a['recovered']}</b> · ⚠️ Revoked: <b>{a['revoked']}</b> · ⌛ Expired: <b>{a['expired']}</b>\\n📨 Pending Join Requests: <b>{a['pending_join']}</b>\\n\\n🏆 <b>Top Referrers</b>\\n{top}")
+          f"🤝 Referrals: <b>{a['referrals']}</b> ({a['referral_rate']:.1f}%)\\n🎁 Rewards: <b>{a['rewards']}</b> ({a['reward_rate']:.1f}%)\\n\\n🏆 <b>Top Referrers</b>\\n{top}")
     await callback.message.edit_text(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Analytics",callback_data="v3_analytics")],[v3_nav()]]))
     await callback.answer()
 
@@ -4787,7 +4290,7 @@ async def master_clone_pool_capacity(db_path: str) -> int:
     except Exception:
         return 0
 
-def _clone_env(clone_id: str, token: str, admin_ids: list[int], clone_name: str = "") -> dict[str, str]:
+def _clone_env(clone_id: str, token: str, admin_ids: list[int]) -> dict[str, str]:
     env = os.environ.copy()
     env["BOT_TOKEN"] = token
     env["CLONE_MODE"] = "1"
@@ -4798,7 +4301,6 @@ def _clone_env(clone_id: str, token: str, admin_ids: list[int], clone_name: str 
     env["CLONE_DB_PATH"] = env["DB_PATH"]
     env["MASTER_USERNAME"] = MASTER_USERNAME
     env["MASTER_REGISTRY_DB_PATH"] = DB_PATH
-    env["CLONE_NAME"] = clone_name
     Path(env["DB_PATH"]).parent.mkdir(parents=True, exist_ok=True)
     return env
 
@@ -4842,7 +4344,7 @@ async def launch_registered_clone(clone_id: str) -> tuple[bool, str]:
         log_fh = open(log_path, "ab")
         proc = subprocess.Popen(
             [sys.executable, os.path.abspath(__file__)],
-            env=_clone_env(clone_id, token, admins, row["bot_name"] or ""),
+            env=_clone_env(clone_id, token, admins),
             stdin=subprocess.DEVNULL,
             stdout=log_fh,
             stderr=log_fh,
