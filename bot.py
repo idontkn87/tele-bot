@@ -244,7 +244,7 @@ def pretty_number(canonical: str) -> str:
 UI_MESSAGES = {
     "admin_panel": ("👑 <b>ADMIN CONTROL CENTER</b>\n\n😀 <b>Welcome, {admin_name}!</b>\n\nYour command center is ready.\nManage your bot, users, rewards, channels, content and system settings from one place. 🔥\n\n🚨 <i>Everything under your control.</i>"),
     "start_admin": ("👑 <b>Welcome, Admin!</b>\n\n✨ Your control panel is ready.\n🛠 You can customize messages, buttons, premium/custom emoji, banners and every major user-facing screen."),
-    "gate": ("🔒 <b>JOIN CHANNEL</b>\n\nBot को इस्तेमाल करने के लिए पहले required channel join करें."),
+    "gate": ("🔒 <b>JOIN CHANNEL</b>\n\nपहले required channel join करें। अगर channel में Join Request आता है, request भेजते ही आप आगे बढ़ सकते हैं।"),
     "captcha": ("🧩 <b>Step 2 — Human Verification</b>\n\n✨ Complete this quick verification to continue.\n\nWhat is <b>{question}</b>?"),
     "phone": ("📱 <b>Step 3 — Phone Verification</b>\n\n🇮🇳 Only your own Indian (+91) number is accepted.\n\n✨ Tap <b>{share_button}</b> below to verify securely."),
     "restricted": ("⛔ <b>Access Restricted</b>\n\nYour verification could not be completed.\n\n👨‍💼 If you believe this is a mistake, contact the admin below."),
@@ -295,13 +295,10 @@ UI_THEME = {
 UI_LAYOUT = {"join_columns": 1, "status_columns": 1}
 UI_STATUS = {
     "NOT_JOINED": "❌ Not Joined",
-    "REQUESTED": "⏳ Requested",
-    "PENDING_APPROVAL": "⏳ Requested",
-    "APPROVED": "✅ Approved",
     "MEMBER": "🟢 Joined",
+    "REQUEST_SENT": "✅ Request Sent",
     "LEFT": "❌ Left",
     "KICKED": "🚫 Removed",
-    "EXPIRED": "⌛ Request Expired",
     "ERROR": "⚠️ Verification Error",
 }
 UI_BRANDING = {"master_locked": True}
@@ -470,7 +467,7 @@ FEATURE_NAMES = (
     "dashboard", "users", "user_search", "user_moderation",
     "referral", "referral_adjustment", "reward_claim", "reward_pool",
     "reward_caption", "reward_history", "reward_reset",
-    "channel_view", "channel_manage", "join_requests", "force_join",
+    "channel_view", "channel_manage", "force_join",
     "captcha", "phone_verification", "verification",
     "broadcast", "scheduled_broadcast",
     "basic_analytics", "advanced_analytics", "charts",
@@ -484,7 +481,7 @@ BASIC_FEATURES = {
 }
 STANDARD_FEATURES = BASIC_FEATURES | {
     "user_moderation","referral_adjustment","reward_pool","reward_history","reward_reset",
-    "channel_manage","join_requests","broadcast","basic_analytics","advanced_analytics",
+    "channel_manage","broadcast","basic_analytics","advanced_analytics",
     "csv_export","backup","diagnostics","content_edit","button_edit","banner_edit",
 }
 PREMIUM_FEATURES = set(FEATURE_NAMES)
@@ -628,37 +625,6 @@ async def init_db() -> None:
             """
         )
 
-        # Additive join-request state machine. pending_join remains for
-        # backward compatibility and is synchronized with this table.
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS join_request_states (
-                user_id              INTEGER NOT NULL,
-                channel_id           INTEGER NOT NULL,
-                status               TEXT NOT NULL DEFAULT 'REQUESTED',
-                requested_at         TEXT NOT NULL,
-                approved_at          TEXT,
-                member_verified_at   TEXT,
-                last_checked_at      TEXT,
-                last_error           TEXT,
-                notification_sent    INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (user_id, channel_id)
-            )
-            """
-        )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_join_states_channel_status "
-            "ON join_request_states(channel_id, status)"
-        )
-        # Backfill legacy pending_join rows without deleting or changing them.
-        await db.execute(
-            """
-            INSERT OR IGNORE INTO join_request_states
-                (user_id, channel_id, status, requested_at)
-            SELECT user_id, channel_id, 'REQUESTED', requested_at
-            FROM pending_join
-            """
-        )
         # Bulk WhatsApp-number reward pool. handout_count tracks how many
         # users have already received this number (capped at MAX_USERS_PER_NUMBER).
         await db.execute(
@@ -811,15 +777,7 @@ async def init_db() -> None:
             "refer_banner_file_id": "",
             "task_banner_caption": "🎯 <b>Task & Earn</b>\n\nComplete tasks, stay active and unlock your rewards. 🚀",
             "refer_banner_caption": "🤝 <b>Refer & Earn</b>\n\nInvite genuine friends, complete verification and unlock your rewards. 🎁",
-            "auto_approve_join_requests": "0",
-            "join_request_last_error": "",
-            # 0 = never expire; otherwise minutes: 15, 30, 60, 360, 1440.
-            "join_request_expiration_minutes": "0",
             "ui_theme": "PREMIUM",
-            "join_last_event_at": "",
-            "join_approved_today": "0",
-            "join_rejected_today": "0",
-            "join_expired_today": "0",
             "maintenance_mode": "0",
             "broadcast_delay": "0.07",
             "maintenance_message": "🛠 <b>Temporarily Under Maintenance</b>\n\n✨ {bot_name} is being improved. Please try again shortly.",
@@ -1022,211 +980,31 @@ async def credit_referral_and_mark(referred_user_id: int, referrer_id: int) -> b
         return True
 
 
-JOIN_STATUSES = {
-    "NOT_JOINED", "REQUESTED", "PENDING_APPROVAL", "APPROVED",
-    "MEMBER", "LEFT", "KICKED", "EXPIRED", "ERROR",
-}
-
-async def _set_join_state(
-    user_id: int,
-    channel_id: int,
-    status: str,
-    *,
-    requested_at: str | None = None,
-    approved_at: str | None = None,
-    member_verified_at: str | None = None,
-    last_error: str | None = None,
-    notification_sent: int | None = None,
-) -> None:
-    if status not in JOIN_STATUSES:
-        status = "ERROR"
-    now = datetime.now(timezone.utc).isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            INSERT INTO join_request_states(
-                user_id, channel_id, status, requested_at, approved_at,
-                member_verified_at, last_checked_at, last_error, notification_sent
-            ) VALUES(?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(user_id,channel_id) DO UPDATE SET
-                status=excluded.status,
-                requested_at=COALESCE(excluded.requested_at, join_request_states.requested_at),
-                approved_at=COALESCE(excluded.approved_at, join_request_states.approved_at),
-                member_verified_at=COALESCE(excluded.member_verified_at, join_request_states.member_verified_at),
-                last_checked_at=excluded.last_checked_at,
-                last_error=excluded.last_error,
-                notification_sent=COALESCE(excluded.notification_sent, join_request_states.notification_sent)
-            """,
-            (
-                user_id, channel_id, status,
-                requested_at or now, approved_at, member_verified_at,
-                now, last_error, notification_sent if notification_sent is not None else 0,
-            ),
-        )
-        await db.commit()
-
+# ---------------------------------------------------------------------------
+# Join Request support — intentionally simple.
+# A Join Request is only a gate signal; approval is never required.
+# The legacy join_request_states table is no longer used by the flow.
+# pending_join is kept as a lightweight request log for backward compatibility.
+# ---------------------------------------------------------------------------
 
 async def record_join_request(user_id: int, channel_id: int) -> None:
     now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            """
-            INSERT INTO pending_join(user_id, channel_id, requested_at)
-            VALUES(?,?,?)
-            ON CONFLICT(user_id,channel_id) DO UPDATE SET requested_at=excluded.requested_at
-            """,
+            "INSERT INTO pending_join(user_id, channel_id, requested_at) VALUES(?,?,?) "
+            "ON CONFLICT(user_id,channel_id) DO UPDATE SET requested_at=excluded.requested_at",
             (user_id, channel_id, now),
         )
-        await db.execute(
-            """
-            INSERT INTO join_request_states(user_id, channel_id, status, requested_at, last_checked_at, last_error)
-            VALUES(?,?, 'REQUESTED', ?, ?, NULL)
-            ON CONFLICT(user_id,channel_id) DO UPDATE SET
-                status=CASE
-                    WHEN join_request_states.status IN ('MEMBER','APPROVED') THEN join_request_states.status
-                    ELSE 'REQUESTED'
-                END,
-                requested_at=excluded.requested_at,
-                last_checked_at=excluded.last_checked_at,
-                last_error=NULL
-            """,
-            (user_id, channel_id, now, now),
-        )
         await db.commit()
 
 
-async def set_join_request_status(
-    user_id: int,
-    channel_id: int,
-    status: str,
-    *,
-    approved: bool = False,
-    member_verified: bool = False,
-    error: str | None = None,
-) -> None:
-    now = datetime.now(timezone.utc).isoformat()
-    await _set_join_state(
-        user_id, channel_id, status,
-        approved_at=now if approved else None,
-        member_verified_at=now if member_verified else None,
-        last_error=(error or None),
-    )
-    async with aiosqlite.connect(DB_PATH) as db:
-        if status == "MEMBER":
-            await db.execute(
-                "DELETE FROM pending_join WHERE user_id=? AND channel_id=?",
-                (user_id, channel_id),
-            )
-        elif status in {"LEFT", "KICKED", "EXPIRED"}:
-            await db.execute(
-                "DELETE FROM pending_join WHERE user_id=? AND channel_id=?",
-                (user_id, channel_id),
-            )
-        db.commit if False else None
-        await db.commit()
-
-
-async def clear_join_request(user_id: int, channel_id: int) -> None:
-    # Legacy API retained. It now records the terminal state instead of
-    # destroying state-machine history.
-    await set_join_request_status(user_id, channel_id, "MEMBER", member_verified=True)
-
-
-async def has_pending_join(user_id: int, channel_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT status FROM join_request_states WHERE user_id=? AND channel_id=?",
-            (user_id, channel_id),
-        )
-        row = await cursor.fetchone()
-    return bool(row and row[0] in {"REQUESTED", "PENDING_APPROVAL", "APPROVED"})
-
-
-async def get_join_state(user_id: int, channel_id: int) -> Optional[aiosqlite.Row]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT * FROM join_request_states WHERE user_id=? AND channel_id=?",
-            (user_id, channel_id),
-        )
-        return await cur.fetchone()
-
-
-def _parse_iso(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(value)
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    except (TypeError, ValueError):
-        return None
-
-
-async def _request_expired(state: aiosqlite.Row | None) -> bool:
-    if not state or state["status"] not in {"REQUESTED", "PENDING_APPROVAL", "APPROVED"}:
-        return False
-    try:
-        minutes = int(await get_setting("join_request_expiration_minutes", "0"))
-    except ValueError:
-        minutes = 0
-    if minutes <= 0:
-        return False
-    requested = _parse_iso(state["requested_at"])
-    return bool(requested and datetime.now(timezone.utc) - requested >= timedelta(minutes=minutes))
-
-
-async def mark_join_expired(user_id: int, channel_id: int) -> None:
-    await set_join_request_status(user_id, channel_id, "EXPIRED")
-    await set_setting("join_expired_today", str(int(await get_setting("join_expired_today", "0")) + 1))
-
-
-async def mark_join_approved(user_id: int, channel_id: int) -> None:
-    await set_join_request_status(user_id, channel_id, "APPROVED", approved=True)
-
-
-async def mark_join_member(user_id: int, channel_id: int) -> None:
-    await set_join_request_status(user_id, channel_id, "MEMBER", member_verified=True)
-
-
-async def mark_join_error(user_id: int, channel_id: int, error: str) -> None:
-    await _set_join_state(user_id, channel_id, "ERROR", last_error=error[:1000])
-
-
-async def join_state_counts() -> dict:
-    result = {s: 0 for s in JOIN_STATUSES}
+async def has_join_request(user_id: int, channel_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT status, COUNT(*) FROM join_request_states GROUP BY status"
+            "SELECT 1 FROM pending_join WHERE user_id=? AND channel_id=? LIMIT 1",
+            (user_id, channel_id),
         )
-        for status, count in await cur.fetchall():
-            result[status] = int(count)
-    return result
-
-
-async def pending_join_rows(channel_id: int | None = None, limit: int = 50) -> list[aiosqlite.Row]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        if channel_id is None:
-            cur = await db.execute(
-                """
-                SELECT j.*, u.username, u.first_name
-                FROM join_request_states j
-                LEFT JOIN users u ON u.user_id=j.user_id
-                WHERE j.status IN ('REQUESTED','PENDING_APPROVAL','APPROVED')
-                ORDER BY j.requested_at ASC LIMIT ?
-                """, (limit,)
-            )
-        else:
-            cur = await db.execute(
-                """
-                SELECT j.*, u.username, u.first_name
-                FROM join_request_states j
-                LEFT JOIN users u ON u.user_id=j.user_id
-                WHERE j.channel_id=? AND j.status IN ('REQUESTED','PENDING_APPROVAL','APPROVED')
-                ORDER BY j.requested_at ASC LIMIT ?
-                """, (channel_id, limit)
-            )
-        return list(await cur.fetchall())
+        return await cur.fetchone() is not None
 
 
 async def get_setting(key: str, default: str = "") -> str:
@@ -1515,7 +1293,7 @@ def display_name(row: aiosqlite.Row) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Verification flow — ORDER: gate (channels) -> captcha -> phone -> done
+# Verification flow — ORDER: join/request gate -> captcha -> phone -> done
 # ---------------------------------------------------------------------------
 
 STEP_GATE = "gate"
@@ -1715,13 +1493,10 @@ async def protected_feature_for_event(event, data) -> str:
         "adm_broadcast":"broadcast","v3_broadcast":"broadcast","v3_bc_start":"broadcast",
         "adm_numbers":"reward_pool","v3_rewards":"reward_history",
         "adm_channels":"channel_manage","v3_channels":"channel_view",
-        "adm_joinreq":"join_requests","adm_verify":"captcha",
         "adm_editor":"content_edit","adm_banner":"banner_edit",
         "adm_backup":"backup","v3_backup":"backup","adm_system":"settings",
         "adm_reset":"reward_reset","adm_mode":"settings","adm_reward":"reward_caption",
         "adm_required":"referral", "adm_reward_rules":"referral", "adm_reward_rules":"referral","adm_setadmin":"settings","adm_export":"csv_export",
-        "jr_toggle":"join_requests","jr_info":"join_requests","jr_center":"join_requests",
-        "jr_refresh":"join_requests","jr_health":"join_requests","jr_expire":"join_requests",
         "ui_theme":"content_edit","ui_preview_gate":"content_view",
     }
     if cb in exact:
@@ -1732,8 +1507,7 @@ async def protected_feature_for_event(event, data) -> str:
         ("ch_", "channel_manage"), ("num_", "reward_pool"),
         ("v3_user_", "users"), ("v3_reward_", "reward_history"),
         ("v3_ch_", "channel_manage"), ("v3_backup_", "backup"),
-        ("sys_", "settings"), ("mode_", "settings"), ("jr_channel:", "join_requests"),
-        ("theme:", "content_edit"),
+        ("sys_", "settings"), ("mode_", "settings"),         ("theme:", "content_edit"),
     )
     for prefix, feature in prefixes:
         if cb.startswith(prefix):
@@ -1843,26 +1617,17 @@ async def phone_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=await ui_button("share_number"), request_contact=True)]], resize_keyboard=True, one_time_keyboard=True)
 
 
-def gate_keyboard(channels: list[aiosqlite.Row], join_label: str = "") -> InlineKeyboardMarkup:
-    """Channel-only gate keyboard. No Verify/Continue/Approval controls."""
-    join_buttons = [
-        InlineKeyboardButton(text=f"📢 {ch['title']}", url=ch['invite_link'])
-        for ch in channels
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=_rows_of_two(join_buttons))
-
-
-async def build_gate_keyboard(bot: Bot, user_id: int, channels: list[aiosqlite.Row]) -> InlineKeyboardMarkup:
-    """Render only the required channel buttons.
-
-    Membership is verified automatically from Telegram chat/member updates;
-    there is deliberately no user-facing verification, approval, or navigation button here.
-    """
+def gate_keyboard(channels: list[aiosqlite.Row], join_label: str = "📢 Join Channel") -> InlineKeyboardMarkup:
+    """Simple join buttons. No approval/check/pending controls."""
     rows = [
-        [InlineKeyboardButton(text=f"📢 {ch['title']}", url=ch['invite_link'])]
+        [InlineKeyboardButton(text=join_label, url=ch["invite_link"])]
         for ch in channels
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def build_gate_keyboard(bot: Bot, user_id: int, channels: list[aiosqlite.Row]) -> InlineKeyboardMarkup:
+    return gate_keyboard(channels)
 
 
 async def contact_admin_keyboard() -> InlineKeyboardMarkup:
@@ -1934,8 +1699,7 @@ async def admin_panel_keyboard(admin_id: int | None = None) -> InlineKeyboardMar
          InlineKeyboardButton(text="⚙️ Reward Rules", callback_data="adm_reward_rules")],
         [InlineKeyboardButton(text="📞 Manage Numbers", callback_data="adm_numbers"),
          InlineKeyboardButton(text="📢 Manage Channels", callback_data="adm_channels")],
-        [InlineKeyboardButton(text="🛡 Verification", callback_data="adm_verify"),
-         InlineKeyboardButton(text="🤖 Join Requests", callback_data="adm_joinreq")],
+        [InlineKeyboardButton(text="🛡 Verification", callback_data="adm_verify")],
         [InlineKeyboardButton(text="👨‍💼 Admin Contact", callback_data="adm_setadmin"),
          InlineKeyboardButton(text="🖼 Mode Banner", callback_data="adm_banner")],
         [InlineKeyboardButton(text="📣 Broadcast", callback_data="adm_broadcast"),
@@ -2453,49 +2217,37 @@ async def _member_is_verified(bot: Bot, user_id: int, channel_id: int) -> tuple[
 
 
 async def _evaluate_required_channels(bot: Bot, user_id: int) -> dict:
+    """Evaluate the force-join gate.
+
+    Normal channels require real Telegram membership. For a channel that sent a
+    ChatJoinRequest event, the request itself satisfies this gate immediately;
+    approval/member status is deliberately not consulted.
+    """
     channels = await get_channels()
     results = []
-    all_member = True
-    pending = False
+    all_satisfied = True
     errors = False
 
     for ch in channels:
         channel_id = ch["channel_id"]
-        state = await get_join_state(user_id, channel_id)
-
-        if await _request_expired(state):
-            await mark_join_expired(user_id, channel_id)
-            state = await get_join_state(user_id, channel_id)
-
         membership, error = await _member_is_verified(bot, user_id, channel_id)
+        request_sent = await has_join_request(user_id, channel_id)
 
         if membership == "MEMBER":
-            await mark_join_member(user_id, channel_id)
             final_status = "MEMBER"
+        elif request_sent:
+            # Join Request Sent = Continue. Never wait for approval.
+            final_status = "REQUEST_SENT"
         elif membership == "KICKED":
-            await set_join_request_status(user_id, channel_id, "KICKED")
             final_status = "KICKED"
-            all_member = False
-        elif membership == "LEFT":
-            # A pending request is not proof of membership. Preserve pending
-            # state while Telegram still reports the user as non-member.
-            if state and state["status"] in {"REQUESTED", "PENDING_APPROVAL", "APPROVED"}:
-                final_status = state["status"]
-                pending = state["status"] in {"REQUESTED", "PENDING_APPROVAL"}
-                all_member = False
-            else:
-                await set_join_request_status(user_id, channel_id, "LEFT")
-                final_status = "LEFT"
-                all_member = False
-        else:
+            all_satisfied = False
+        elif membership == "ERROR":
+            final_status = "ERROR"
             errors = True
-            all_member = False
-            if state and state["status"] in {"REQUESTED", "PENDING_APPROVAL", "APPROVED"}:
-                final_status = state["status"]
-                pending = state["status"] in {"REQUESTED", "PENDING_APPROVAL"}
-            else:
-                await mark_join_error(user_id, channel_id, error or "membership_check_failed")
-                final_status = "ERROR"
+            all_satisfied = False
+        else:
+            final_status = "LEFT"
+            all_satisfied = False
 
         results.append({
             "channel_id": channel_id,
@@ -2505,14 +2257,14 @@ async def _evaluate_required_channels(bot: Bot, user_id: int) -> dict:
             "error": error,
         })
 
-    if all_member:
+    if all_satisfied:
         await mark_joined_gate(user_id)
     else:
         await unmark_joined_gate(user_id)
 
     return {
-        "all_member": all_member,
-        "pending": pending,
+        "all_member": all_satisfied,
+        "pending": False,
         "errors": errors,
         "channels": results,
     }
@@ -2520,46 +2272,60 @@ async def _evaluate_required_channels(bot: Bot, user_id: int) -> dict:
 
 @user_router.chat_join_request()
 async def on_chat_join_request(update: ChatJoinRequest, bot: Bot) -> None:
-    user_id=update.from_user.id; channel_id=update.chat.id
-    channels=await get_channels()
-    if channel_id not in {c["channel_id"] for c in channels}: return
-    user=await get_user(user_id)
-    if not user or user["banned"] or user["restricted"] or is_admin(user_id): return
-    await record_join_request(user_id,channel_id); await set_join_request_status(user_id,channel_id,"PENDING_APPROVAL")
-    await set_setting("join_last_event_at",datetime.now(timezone.utc).strftime("%H:%M:%S"))
-    auto=await get_setting("auto_approve_join_requests","0")=="1"
-    if not auto:
-        logger.info("Join request silently stored: user=%s channel=%s",user_id,channel_id); return
-    try:
-        await bot.approve_chat_join_request(chat_id=channel_id,user_id=user_id); await mark_join_approved(user_id,channel_id)
-        # Approval is not membership. Verification is completed only after a fresh get_chat_member/member update.
-        for _ in range(6):
-            membership,_=await _member_is_verified(bot,user_id,channel_id)
-            if membership=="MEMBER":
-                await mark_join_member(user_id,channel_id); break
-            await asyncio.sleep(1)
-        result=await _evaluate_required_channels(bot,user_id)
-        if result["all_member"]:
-            await mark_joined_gate(user_id); await maybe_credit_referral(user_id,bot); await render_flow(bot,user_id,user_id)
-    except Exception as exc:
-        await mark_join_error(user_id,channel_id,type(exc).__name__)
-        logger.exception("Auto approval failed for user=%s channel=%s",user_id,channel_id)
+    """Treat a successfully received join request as immediate gate completion."""
+    user_id = update.from_user.id
+    channel_id = update.chat.id
+    channels = await get_channels()
+    if channel_id not in {c["channel_id"] for c in channels}:
+        return
+
+    user = await get_user(user_id)
+    if not user or user["banned"] or user["restricted"] or is_admin(user_id):
+        return
+
+    # Log only. There is no approval workflow, no expiration, and no auto-approve.
+    await record_join_request(user_id, channel_id)
+    logger.info("Join request received; gate continues immediately: user=%s channel=%s", user_id, channel_id)
+
+    result = await _evaluate_required_channels(bot, user_id)
+    if result["all_member"]:
+        await maybe_credit_referral(user_id, bot)
+        await render_flow(bot, user_id, user_id)
+    else:
+        await render_gate(bot, user_id)
 
 
 @user_router.chat_member()
 async def on_chat_member_update(event: ChatMemberUpdated, bot: Bot) -> None:
-    channels=await get_channels()
-    if event.chat.id not in {c["channel_id"] for c in channels}: return
-    user_id=event.new_chat_member.user.id
-    if is_admin(user_id): return
-    status=event.new_chat_member.status
-    if status in (ChatMemberStatus.MEMBER,ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.CREATOR) or (status==ChatMemberStatus.RESTRICTED and bool(getattr(event.new_chat_member,"is_member",False))):
-        await mark_join_member(user_id,event.chat.id); result=await _evaluate_required_channels(bot,user_id)
-        if result["all_member"]:
-            await mark_joined_gate(user_id); await maybe_credit_referral(user_id,bot)
-            flow=await get_flow_message(user_id); await render_flow(bot,user_id,user_id,edit_message=None if not flow else await _safe_get_message(bot,flow["chat_id"],flow["message_id"]))
+    channels = await get_channels()
+    if event.chat.id not in {c["channel_id"] for c in channels}:
         return
-    await set_join_request_status(user_id,event.chat.id,"KICKED" if status==ChatMemberStatus.KICKED else "LEFT"); await unmark_joined_gate(user_id)
+    user_id = event.new_chat_member.user.id
+    if is_admin(user_id):
+        return
+
+    status = event.new_chat_member.status
+    if status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR) or (
+        status == ChatMemberStatus.RESTRICTED and bool(getattr(event.new_chat_member, "is_member", False))
+    ):
+        result = await _evaluate_required_channels(bot, user_id)
+        if result["all_member"]:
+            await mark_joined_gate(user_id)
+            await maybe_credit_referral(user_id, bot)
+            flow = await get_flow_message(user_id)
+            await render_flow(
+                bot,
+                user_id,
+                user_id,
+                edit_message=None if not flow else await _safe_get_message(bot, flow["chat_id"], flow["message_id"]),
+            )
+        return
+
+    # A user leaving/kicked from a normal channel must pass the normal membership gate again.
+    if not await has_join_request(user_id, event.chat.id):
+        await unmark_joined_gate(user_id)
+        await render_flow(bot, user_id, user_id)
+
 
 async def _safe_get_message(bot:Bot,chat_id:int,message_id:int):
     # Telegram has no get_message API. Return None; the renderer will replace the tracked message safely.
@@ -3284,199 +3050,8 @@ async def process_channel_link(message: Message, state: FSMContext) -> None:
 
 
 
-# --- Join request control -----------------------------------------------------
-
-def join_request_keyboard(enabled: bool) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"🤖 Auto-Approve: {'✅ ON' if enabled else '❌ OFF'}",
-            callback_data="jr_toggle"
-        )],
-        [InlineKeyboardButton(text="⏳ Join Request Center", callback_data="jr_center"),
-         InlineKeyboardButton(text="🩺 Channel Health", callback_data="jr_health")],
-        [InlineKeyboardButton(text="⌛ Expiration", callback_data="jr_expire"),
-         InlineKeyboardButton(text="ℹ️ How it works", callback_data="jr_info")],
-        [InlineKeyboardButton(text="⬅️ Back", callback_data="adm_back")],
-    ])
-
-@admin_router.callback_query(F.data == "adm_joinreq")
-async def cb_join_request_settings(callback: CallbackQuery) -> None:
-    enabled = await get_setting("auto_approve_join_requests", "0") == "1"
-    last_error = await get_setting("join_request_last_error", "")
-    expiration = await get_setting("join_request_expiration_minutes", "0")
-    counts = await join_state_counts()
-    error_line = f"\n⚠️ Last error: <code>{hesc(last_error[-500:])}</code>\n" if last_error else ""
-    await callback.message.edit_text(
-        "⏳ <b>JOIN REQUEST CONTROL</b>\n\n"
-        f"Mode: <b>{'AUTO-APPROVE' if enabled else 'MANUAL'}</b>\n"
-        f"Pending: <b>{counts.get('REQUESTED',0)+counts.get('PENDING_APPROVAL',0)+counts.get('APPROVED',0)}</b>\n"
-        f"Approved today: <b>{hesc(await get_setting('join_approved_today','0'))}</b>\n"
-        f"Expired today: <b>{hesc(await get_setting('join_expired_today','0'))}</b>\n"
-        f"Expiration: <b>{'Never' if expiration == '0' else expiration + ' minutes'}</b>\n"
-        f"Last Event: <b>{hesc(await get_setting('join_last_event_at','None') or 'None')}</b>\n"
-        f"{error_line}\n"
-        "Join requests are NEVER treated as membership. The final gate is unlocked "
-        "only after a fresh Telegram membership check succeeds.",
-        reply_markup=join_request_keyboard(enabled),
-    )
-    await callback.answer()
-
-
-@admin_router.callback_query(F.data == "jr_toggle")
-async def cb_join_request_toggle(callback: CallbackQuery) -> None:
-    current = await get_setting("auto_approve_join_requests", "0") == "1"
-    new = "0" if current else "1"
-    await set_setting("auto_approve_join_requests", new)
-    await callback.message.edit_text(
-        "🤖 <b>Join Request Control</b>\n\n"
-        f"Auto-Approve is now <b>{'ON ✅' if new == '1' else 'OFF ❌'}</b>.\n\n"
-        "Approval never bypasses membership verification.",
-        reply_markup=join_request_keyboard(new == "1"),
-    )
-    await callback.answer("Auto-Approve updated.")
-
-
-@admin_router.callback_query(F.data == "jr_expire")
-async def cb_join_request_expiration(callback: CallbackQuery) -> None:
-    choices = ["0", "15", "30", "60", "360", "1440"]
-    current = await get_setting("join_request_expiration_minutes", "0")
-    try:
-        idx = choices.index(current)
-    except ValueError:
-        idx = 0
-    new = choices[(idx + 1) % len(choices)]
-    await set_setting("join_request_expiration_minutes", new)
-    label = "Never" if new == "0" else f"{new} minutes"
-    await callback.answer(f"Request expiration: {label}")
-    await cb_join_request_settings(callback)
-
-
-@admin_router.callback_query(F.data == "jr_info")
-async def cb_join_request_info(callback: CallbackQuery) -> None:
-    await callback.answer(
-        "A request is REQUESTED/PENDING until approved. APPROVED is still not membership. "
-        "Only get_chat_member()/chat_member verification can unlock the gate.",
-        show_alert=True,
-    )
-
-
-def _join_center_keyboard(channels: list[aiosqlite.Row]) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text=f"📢 {ch['title']}", callback_data=f"jr_channel:{ch['channel_id']}")]
-        for ch in channels
-    ]
-    rows += [
-        [InlineKeyboardButton(text="🔄 Refresh", callback_data="jr_refresh"),
-         InlineKeyboardButton(text="🩺 Health", callback_data="jr_health")],
-        [InlineKeyboardButton(text="⬅️ Back", callback_data="adm_joinreq")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@admin_router.callback_query(F.data.in_({"jr_center", "jr_refresh"}))
-async def cb_join_request_center(callback: CallbackQuery) -> None:
-    counts = await join_state_counts()
-    channels = await get_channels()
-    total_pending = counts.get("REQUESTED",0) + counts.get("PENDING_APPROVAL",0) + counts.get("APPROVED",0)
-    lines = [
-        "⏳ <b>JOIN REQUEST CENTER</b>",
-        "━━━━━━━━━━━━━━━━━━",
-        f"Total Pending: <b>{total_pending}</b>",
-    ]
-    for ch in channels:
-        rows = await pending_join_rows(ch["channel_id"], limit=10000)
-        lines.append(f"📢 {hesc(ch['title'])}: <b>{len(rows)}</b>")
-    lines.append("\nSelect a channel to view pending users.")
-    await callback.message.edit_text("\n".join(lines), reply_markup=_join_center_keyboard(channels))
-    await callback.answer("Refreshed." if callback.data == "jr_refresh" else "")
-
-
-@admin_router.callback_query(F.data.startswith("jr_channel:"))
-async def cb_join_request_channel(callback: CallbackQuery) -> None:
-    try:
-        channel_id = int(callback.data.split(":",1)[1])
-    except (ValueError, IndexError):
-        await callback.answer("Invalid channel.", show_alert=True)
-        return
-    channels = await get_channels()
-    channel = next((c for c in channels if c["channel_id"] == channel_id), None)
-    if channel is None:
-        await callback.answer("Channel not found.", show_alert=True)
-        return
-    rows = await pending_join_rows(channel_id, limit=50)
-    lines = [
-        f"📢 <b>{hesc(channel['title'])}</b>",
-        "━━━━━━━━━━━━━━━━━━",
-        f"⏳ Pending users: <b>{len(rows)}</b>",
-        "",
-    ]
-    if not rows:
-        lines.append("No active requests.")
-    for row in rows:
-        name = hesc(row["first_name"] or row["username"] or "Unknown")
-        username = f"@{hesc(row['username'])}" if row["username"] else "—"
-        lines.append(
-            f"👤 <b>{name}</b>\n"
-            f"🆔 <code>{row['user_id']}</code>  🔗 {username}\n"
-            f"🕐 {hesc(row['requested_at'])}\n"
-            f"⏳ {hesc(UI_STATUS.get(row['status'], row['status']))}\n"
-        )
-    await callback.message.edit_text(
-        "\n".join(lines)[:4096],
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Refresh", callback_data=f"jr_channel:{channel_id}")],
-            [InlineKeyboardButton(text="⬅️ Request Center", callback_data="jr_center")],
-        ]),
-    )
-    await callback.answer()
-
-
-@admin_router.callback_query(F.data == "jr_health")
-async def cb_join_request_health(callback: CallbackQuery, bot: Bot) -> None:
-    channels = await get_channels()
-    if not channels:
-        await callback.message.edit_text(
-            "🩺 <b>JOIN REQUEST DIAGNOSTICS</b>\n\nNo channels configured.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ Back", callback_data="adm_joinreq")]
-            ]),
-        )
-        await callback.answer()
-        return
-
-    bot_me = await bot.get_me()
-    lines = ["🩺 <b>JOIN REQUEST DIAGNOSTICS</b>", "━━━━━━━━━━━━━━━━━━"]
-    for ch in channels:
-        admin_ok = approve_ok = membership_ok = invite_ok = False
-        err = ""
-        try:
-            member = await bot.get_chat_member(ch["channel_id"], bot_me.id)
-            admin_ok = member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR)
-            rights = getattr(member, "can_invite_users", None)
-            approve_ok = admin_ok and (rights is not False)
-            membership_ok = True
-            invite_ok = bool(ch["invite_link"])
-            status = "🟢 HEALTHY" if all((admin_ok, approve_ok, membership_ok, invite_ok)) else "🟡 LIMITED"
-        except Exception as exc:
-            err = type(exc).__name__
-            status = "🔴 BROKEN"
-        lines.append(
-            f"📢 <b>{hesc(ch['title'])}</b>\n"
-            f"Admin: {'✅' if admin_ok else '❌'}  "
-            f"Approve Requests: {'✅' if approve_ok else '❌'}\n"
-            f"Membership Check: {'✅' if membership_ok else '❌'}  "
-            f"Invite: {'✅' if invite_ok else '❌'}\n"
-            f"Status: <b>{status}</b>{f' — {hesc(err)}' if err else ''}\n"
-        )
-    await callback.message.edit_text(
-        "\n".join(lines)[:4096],
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Refresh", callback_data="jr_health")],
-            [InlineKeyboardButton(text="⬅️ Back", callback_data="adm_joinreq")],
-        ]),
-    )
-    await callback.answer()
-
+# --- Join Request admin controls intentionally removed -----------------------
+# Join requests are handled as a user-flow signal only.
 
 # --- Broadcast --------------------------------------------------------------
 
@@ -3574,14 +3149,11 @@ async def cb_sys_diagnostics(callback: CallbackQuery) -> None:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("SELECT 1")
         clone_count = sum(1 for info in _clones.values() if info["process"].poll() is None)
-        last_join_error = await get_setting("join_request_last_error", "") or "None"
         text = (
             "🩺 <b>System Diagnostics</b>\n\n"
             f"🗄 Database: <b>{'OK' if db_ok else 'ERROR'}</b>\n"
             f"👥 Users: <b>{stats.get('total_users', 0)}</b>\n"
-            f"🧬 Running clones: <b>{clone_count}</b>\n"
-            f"🤖 Join auto-approve: <b>{'ON' if await get_setting('auto_approve_join_requests','0') == '1' else 'OFF'}</b>\n"
-            f"⚠️ Last join-request error: <code>{hesc(last_join_error[-700:])}</code>"
+            f"🧬 Running clones: <b>{clone_count}</b>"
         )
     except Exception as exc:
         text = f"❌ Diagnostics failed: <code>{hesc(type(exc).__name__ + ': ' + str(exc))}</code>"
