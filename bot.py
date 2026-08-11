@@ -718,6 +718,66 @@ async def init_db() -> None:
         )
         """)
 
+        # Permanent reward ledger — every reward issued lives here so rewards
+        # survive a "Reset Referrals" and can be looked up / revoked later.
+        await db.execute("""CREATE TABLE IF NOT EXISTS reward_records (
+            reward_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            clone_id          TEXT,
+            user_id           INTEGER NOT NULL,
+            referral_id       INTEGER,
+            reward_type       TEXT NOT NULL DEFAULT 'agent_number',
+            reward_value      TEXT,
+            reward_number     TEXT,
+            reward_status     TEXT NOT NULL DEFAULT 'RESERVED',
+            created_at        TEXT NOT NULL,
+            delivered_at      TEXT,
+            message_id        INTEGER,
+            chat_id           INTEGER,
+            wa_link           TEXT,
+            recovery_count    INTEGER NOT NULL DEFAULT 0,
+            last_recovery_at  TEXT
+        )
+        """)
+
+        # One row per successful referral credit — used for stats/history.
+        await db.execute("""CREATE TABLE IF NOT EXISTS referral_events (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            referred_user_id  INTEGER NOT NULL,
+            referrer_id       INTEGER NOT NULL,
+            created_at        TEXT NOT NULL
+        )
+        """)
+
+        # Tracks the single "live" flow message per user so screens can be
+        # edited in place instead of sending duplicate messages.
+        await db.execute("""CREATE TABLE IF NOT EXISTS flow_messages (
+            user_id     INTEGER PRIMARY KEY,
+            chat_id     INTEGER NOT NULL,
+            message_id  INTEGER NOT NULL,
+            step        TEXT,
+            updated_at  TEXT NOT NULL
+        )
+        """)
+
+        # Simple key/value schema-version marker.
+        await db.execute("""CREATE TABLE IF NOT EXISTS schema_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """)
+
+        # Version history for admin-edited message templates.
+        await db.execute("""CREATE TABLE IF NOT EXISTS message_versions (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_key  TEXT NOT NULL,
+            version      INTEGER NOT NULL,
+            content      TEXT,
+            created_by   INTEGER,
+            created_at   TEXT NOT NULL
+        )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_message_versions_key ON message_versions(message_key, version)")
+
         # ------------------------------------------------------------------
         # V5 master/clone registry and permission tables. These are additive
         # migrations: existing V3 tables/data are never removed or renamed.
