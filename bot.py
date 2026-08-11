@@ -684,6 +684,84 @@ async def init_db() -> None:
         )
         """)
 
+        # Core tables used by referrals, rewards, editable-message history and
+        # flow-message tracking. These must exist BEFORE indexes/backfills run.
+        # Older versions could have created some of these tables already, so
+        # CREATE IF NOT EXISTS is intentionally non-destructive.
+        await db.execute("""CREATE TABLE IF NOT EXISTS reward_records (
+            reward_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            clone_id TEXT,
+            user_id INTEGER NOT NULL,
+            referral_id INTEGER,
+            reward_type TEXT NOT NULL DEFAULT 'agent_number',
+            reward_value TEXT,
+            reward_number TEXT,
+            reward_status TEXT NOT NULL DEFAULT 'RESERVED',
+            created_at TEXT NOT NULL,
+            delivered_at TEXT,
+            message_id INTEGER,
+            chat_id INTEGER,
+            wa_link TEXT,
+            recovery_count INTEGER NOT NULL DEFAULT 0,
+            last_recovery_at TEXT
+        )
+        """)
+        await db.execute("""CREATE TABLE IF NOT EXISTS referral_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referred_user_id INTEGER NOT NULL,
+            referrer_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """)
+        await db.execute("""CREATE TABLE IF NOT EXISTS flow_messages (
+            user_id INTEGER PRIMARY KEY,
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            step TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """)
+        await db.execute("""CREATE TABLE IF NOT EXISTS message_versions (
+            message_key TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            created_by INTEGER,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (message_key, version)
+        )
+        """)
+        await db.execute("""CREATE TABLE IF NOT EXISTS schema_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """)
+
+        # Additive repair for partially-created/older reward_records tables.
+        # Never delete or rewrite existing reward history.
+        cur = await db.execute("PRAGMA table_info(reward_records)")
+        reward_columns = {row[1] for row in await cur.fetchall()}
+        reward_column_migrations = {
+            "clone_id": "ALTER TABLE reward_records ADD COLUMN clone_id TEXT",
+            "referral_id": "ALTER TABLE reward_records ADD COLUMN referral_id INTEGER",
+            "reward_type": "ALTER TABLE reward_records ADD COLUMN reward_type TEXT NOT NULL DEFAULT 'agent_number'",
+            "reward_value": "ALTER TABLE reward_records ADD COLUMN reward_value TEXT",
+            "reward_number": "ALTER TABLE reward_records ADD COLUMN reward_number TEXT",
+            "reward_status": "ALTER TABLE reward_records ADD COLUMN reward_status TEXT NOT NULL DEFAULT 'RESERVED'",
+            "created_at": "ALTER TABLE reward_records ADD COLUMN created_at TEXT",
+            "delivered_at": "ALTER TABLE reward_records ADD COLUMN delivered_at TEXT",
+            "message_id": "ALTER TABLE reward_records ADD COLUMN message_id INTEGER",
+            "chat_id": "ALTER TABLE reward_records ADD COLUMN chat_id INTEGER",
+            "wa_link": "ALTER TABLE reward_records ADD COLUMN wa_link TEXT",
+            "recovery_count": "ALTER TABLE reward_records ADD COLUMN recovery_count INTEGER NOT NULL DEFAULT 0",
+            "last_recovery_at": "ALTER TABLE reward_records ADD COLUMN last_recovery_at TEXT",
+        }
+        for column, sql in reward_column_migrations.items():
+            if column not in reward_columns:
+                try:
+                    await db.execute(sql)
+                except Exception:
+                    logger.exception("Reward schema migration failed for column %s", column)
+
         # ------------------------------------------------------------------
         # V5 master/clone registry and permission tables. These are additive
         # migrations: existing V3 tables/data are never removed or renamed.
