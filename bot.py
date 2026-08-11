@@ -265,7 +265,6 @@ UI_MESSAGES = {
 
 UI_BUTTONS = {
     "share_number": "📱 Share My Number",
-    "join_continue": "✅ I've Joined — Continue",
     "contact_admin": "👨‍💼 Contact Admin",
     "referral_link": "🔗 REFER & EARN",
     "referral_reward": "🔗 REFER & EARN",
@@ -296,9 +295,9 @@ UI_THEME = {
 UI_LAYOUT = {"join_columns": 1, "status_columns": 1}
 UI_STATUS = {
     "NOT_JOINED": "❌ Not Joined",
-    "REQUESTED": "⏳ Approval Pending",
-    "PENDING_APPROVAL": "⏳ Approval Pending",
-    "APPROVED": "✅ Approved — Verify Membership",
+    "REQUESTED": "⏳ Requested",
+    "PENDING_APPROVAL": "⏳ Requested",
+    "APPROVED": "✅ Approved",
     "MEMBER": "🟢 Joined",
     "LEFT": "❌ Left",
     "KICKED": "🚫 Removed",
@@ -1844,22 +1843,25 @@ async def phone_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=await ui_button("share_number"), request_contact=True)]], resize_keyboard=True, one_time_keyboard=True)
 
 
-def gate_keyboard(channels: list[aiosqlite.Row], join_label: str) -> InlineKeyboardMarkup:
-    # Backward-compatible keyboard builder. The richer per-user status keyboard
-    # is produced by build_gate_keyboard() below.
-    join_buttons = [InlineKeyboardButton(text=f"📢 {ch['title']}", url=ch['invite_link']) for ch in channels]
-    rows = _rows_of_two(join_buttons)
-    rows.append([InlineKeyboardButton(text=join_label, callback_data="gate_check")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+def gate_keyboard(channels: list[aiosqlite.Row], join_label: str = "") -> InlineKeyboardMarkup:
+    """Channel-only gate keyboard. No Verify/Continue/Approval controls."""
+    join_buttons = [
+        InlineKeyboardButton(text=f"📢 {ch['title']}", url=ch['invite_link'])
+        for ch in channels
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=_rows_of_two(join_buttons))
 
 
 async def build_gate_keyboard(bot: Bot, user_id: int, channels: list[aiosqlite.Row]) -> InlineKeyboardMarkup:
-    rows=[]
-    for ch in channels:
-        state=await get_join_state(user_id,ch["channel_id"])
-        status=state["status"] if state else "NOT_JOINED"
-        label=("✅ " if status=="MEMBER" else "⏳ " if status in {"REQUESTED","PENDING_APPROVAL","APPROVED"} else "📢 ")+str(ch["title"])
-        rows.append([InlineKeyboardButton(text=label,url=ch["invite_link"])])
+    """Render only the required channel buttons.
+
+    Membership is verified automatically from Telegram chat/member updates;
+    there is deliberately no user-facing verification, approval, or navigation button here.
+    """
+    rows = [
+        [InlineKeyboardButton(text=f"📢 {ch['title']}", url=ch['invite_link'])]
+        for ch in channels
+    ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -2514,55 +2516,6 @@ async def _evaluate_required_channels(bot: Bot, user_id: int) -> dict:
         "errors": errors,
         "channels": results,
     }
-
-
-async def _notify_membership_verified(bot: Bot, user_id: int) -> None:
-    # Notification is idempotent per channel; only notify after a real MEMBER
-    # transition and never merely because a request was received.
-    try:
-        states = []
-        for ch in await get_channels():
-            state = await get_join_state(user_id, ch["channel_id"])
-            if state:
-                states.append(state)
-        if not states or not all(s["status"] == "MEMBER" for s in states):
-            return
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "SELECT COUNT(*) FROM join_request_states WHERE user_id=? AND notification_sent=0 AND status='MEMBER'",
-                (user_id,),
-            )
-            pending_notifications = int((await cur.fetchone())[0])
-            if pending_notifications == 0:
-                return
-            await db.execute(
-                "UPDATE join_request_states SET notification_sent=1 WHERE user_id=? AND status='MEMBER'",
-                (user_id,),
-            )
-            await db.commit()
-        await bot.send_message(
-            user_id,
-            "🎉 <b>Channel Approved!</b>\n\n"
-            "Your membership has been verified successfully.\n\n"
-            "Tap <b>➡️ Continue</b> to proceed.",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="➡️ Continue", callback_data="gate_check")]]
-            ),
-        )
-    except Exception:
-        logger.exception("Membership notification failed for user %s", user_id)
-
-
-@user_router.callback_query(F.data == "gate_check")
-async def cb_gate_check(callback: CallbackQuery, bot: Bot) -> None:
-    user_id=callback.from_user.id; user=await get_user(user_id)
-    if user is None: await callback.answer("Please send /start first.",show_alert=True); return
-    if user["banned"] or user["restricted"]: await callback.answer("Access restricted.",show_alert=True); return
-    result=await _evaluate_required_channels(bot,user_id)
-    if result["all_member"]:
-        await mark_joined_gate(user_id); await maybe_credit_referral(user_id,bot); await callback.answer("✅"); await render_flow(bot,callback.message.chat.id,user_id,edit_message=callback.message); return
-    await callback.answer("Please join all required channels.")
-    await render_gate(bot,callback.message.chat.id,edit_message=callback.message)
 
 
 @user_router.chat_join_request()
