@@ -1,63 +1,3 @@
-"""
-╔══════════════════════════════════════════════════════════════════════════╗
-║        GMAP AGENT — DUAL-MODE REFERRAL / TASK BOT  (aiogram 3.x)          ║
-╚══════════════════════════════════════════════════════════════════════════╝
-
-WHAT THIS BOT DOES
-------------------
-One bot, two switchable personalities (change any time from /admin → Bot Mode,
-no data is lost, users never leave):
-
-    • 🎯 TASK & EARN   — image/banner says "Task and Earn Bot"
-    • 🤝 REFER & EARN  — "Refer & Earn Bot — Agent Numbers Loot"
-
-In BOTH modes the entry flow is identical and runs in this exact order:
-
-    /start → 🔒 Join Channels → 🧩 Captcha → 📱 Indian-number verify → 🎁 Dashboard
-
-REWARD MODEL
-------------
-Every successful referral pays out ONE WhatsApp number from a bulk pool the
-admin loads. Numbers are handed out one-by-one, spread evenly so the SAME
-number is never given to more than MAX_USERS_PER_NUMBER (default 20) people,
-and the pool is shuffled so users don't all get the same number first. The
-payout arrives as a stylish card with a wa.me button. Premium/custom emoji in
-the admin-set caption are preserved exactly as the admin typed them.
-
-INDIA-ONLY VERIFICATION
------------------------
-Only +91 (10-digit Indian mobile) numbers pass. A non-Indian number RESTRICTS
-(does not delete) the account that started the bot: they see a "Contact Admin"
-screen with a button to the configured admin username, and the person who
-referred them is told the referral was invalid. Restriction is reversible from
-the admin user card.
-
-RESET (keeps everyone)
-----------------------
-/admin → Reset Referrals zeroes every user's referral_count, reward flag and
-handout history so the whole base can earn again — nobody is deleted, your
-broadcast reach is untouched.
-
-CLONE TO A NEW BOT
-------------------
-/admin → Clone Bot lets you paste another BotFather token. The clone runs this
-exact same code and feature set, always credited to your bot's username.
-
-QUICK SETUP
------------
-1.  Token from @BotFather (/newbot).
-2.  Your numeric ID from @userinfobot.
-3.  Fill BOT_TOKEN + ADMIN_IDS below (env vars win over these).
-4.  pip install -r requirements.txt
-5.  python bot.py
-6.  Make the bot ADMIN in every force-join channel (needed even for public ones).
-7.  Configure everything from /admin inside Telegram.
-
-requirements.txt:
-    aiogram>=3.4,<4
-    aiosqlite>=0.19
-"""
-
 import asyncio
 import csv
 import io
@@ -264,6 +204,7 @@ UI_MESSAGES = {
 }
 
 UI_BUTTONS = {
+    "gate_check": "✅ I've Joined / Check Again",
     "share_number": "📱 Share My Number",
     "contact_admin": "👨‍💼 Contact Admin",
     "referral_link": "🔗 REFER & EARN",
@@ -428,8 +369,25 @@ async def user_context(user_id: int, bot: Bot | None = None) -> dict:
     ctx.update(await bot_identity(bot))
     return ctx
 
+MODE_SCOPED_KEYS = {
+    "admin_panel", "start_admin", "main_locked", "main_unlocked",
+    "referral_link", "share_caption", "stats", "help", "reward",
+    "reward_empty", "gate",
+}
+
+async def _mode_scoped_key(key: str) -> str | None:
+    if key not in MODE_SCOPED_KEYS:
+        return None
+    mode = await get_bot_mode()
+    return f"{mode}::{key}"
+
 async def ui_message(key: str, default: str | None = None, **kwargs) -> str:
-    template = await get_setting(f"ui_msg:{key}", UI_MESSAGES.get(key, default or key))
+    scoped_key = await _mode_scoped_key(key)
+    template = None
+    if scoped_key is not None:
+        template = await get_setting(f"ui_msg:{scoped_key}", "") or None
+    if template is None:
+        template = await get_setting(f"ui_msg:{key}", UI_MESSAGES.get(key, default or key))
     context = dict(kwargs)
     if "bot_name" not in context:
         context.update(await bot_identity())
@@ -442,25 +400,83 @@ async def ui_message(key: str, default: str | None = None, **kwargs) -> str:
     return rendered[:4096]
 
 async def ui_button(key: str, default: str | None = None, **kwargs) -> str:
-    value = await get_setting(f"ui_btn:{key}", UI_BUTTONS.get(key, default or key))
+    scoped_key = await _mode_scoped_key(key)
+    value = None
+    if scoped_key is not None:
+        value = await get_setting(f"ui_btn:{scoped_key}", "") or None
+    if value is None:
+        value = await get_setting(f"ui_btn:{key}", UI_BUTTONS.get(key, default or key))
     return render_template(value, kwargs)
 
-async def save_ui_message(key: str, value: str, changed_by: int | None = None) -> None:
+async def save_ui_message(key: str, value: str, changed_by: int | None = None, mode_scoped: bool = False) -> None:
     errors = validate_template_html(value)
     if errors:
         raise ValueError("; ".join(errors[:3]))
     unknown=template_variables(value)-KNOWN_TEMPLATE_VARIABLES
     if unknown:
         raise ValueError("Unknown variable(s): " + ", ".join(sorted(unknown)[:8]))
-    await set_setting(f"ui_msg:{key}", value)
+    storage_key = key
+    if mode_scoped:
+        scoped_key = await _mode_scoped_key(key)
+        if scoped_key is None:
+            raise ValueError("This message is not mode-specific.")
+        storage_key = scoped_key
+    await set_setting(f"ui_msg:{storage_key}", value)
     async with aiosqlite.connect(DB_PATH) as db:
-        cur=await db.execute("SELECT COALESCE(MAX(version),0) FROM message_versions WHERE message_key=?",(key,))
+        cur=await db.execute("SELECT COALESCE(MAX(version),0) FROM message_versions WHERE message_key=?",(storage_key,))
         version=int((await cur.fetchone())[0])+1
-        await db.execute("INSERT INTO message_versions(message_key,version,content,created_by,created_at) VALUES(?,?,?,?,?)",(key,version,value,changed_by,datetime.now(timezone.utc).isoformat()))
+        await db.execute("INSERT INTO message_versions(message_key,version,content,created_by,created_at) VALUES(?,?,?,?,?)",(storage_key,version,value,changed_by,datetime.now(timezone.utc).isoformat()))
         await db.commit()
 
-async def save_ui_button(key: str, value: str) -> None:
-    await set_setting(f"ui_btn:{key}", value)
+async def save_ui_button(key: str, value: str, mode_scoped: bool = False) -> None:
+    storage_key = key
+    if mode_scoped:
+        scoped_key = await _mode_scoped_key(key)
+        if scoped_key is None:
+            raise ValueError("This button is not mode-specific.")
+        storage_key = scoped_key
+    await set_setting(f"ui_btn:{storage_key}", value)
+
+async def get_ui_photo(key: str) -> str:
+    """file_id of an optional photo attached above this message key, mode-aware."""
+    scoped_key = await _mode_scoped_key(key)
+    if scoped_key is not None:
+        file_id = await get_setting(f"ui_photo:{scoped_key}", "")
+        if file_id:
+            return file_id
+    return await get_setting(f"ui_photo:{key}", "")
+
+async def save_ui_photo(key: str, file_id: str, mode_scoped: bool = False) -> None:
+    storage_key = key
+    if mode_scoped:
+        scoped_key = await _mode_scoped_key(key)
+        if scoped_key is None:
+            raise ValueError("This message is not mode-specific.")
+        storage_key = scoped_key
+    await set_setting(f"ui_photo:{storage_key}", file_id)
+
+async def clear_ui_photo(key: str, mode_scoped: bool = False) -> None:
+    await save_ui_photo(key, "", mode_scoped=mode_scoped)
+
+async def send_ui_text(bot: Bot, chat_id: int, key: str, text: str, reply_markup=None, edit_message=None):
+    """Send or edit a UI screen, showing the admin-attached photo (if any)
+    above the caption. Falls back to plain text when no photo is set."""
+    photo = await get_ui_photo(key)
+    if edit_message is not None:
+        try:
+            if photo and edit_message.photo:
+                return await edit_message.edit_caption(caption=text[:1024], reply_markup=reply_markup)
+            if not photo and not edit_message.photo:
+                return await edit_message.edit_text(text, reply_markup=reply_markup)
+        except TelegramBadRequest:
+            pass
+        try:
+            await edit_message.delete()
+        except Exception:
+            pass
+    if photo:
+        return await bot.send_photo(chat_id, photo, caption=text[:1024], reply_markup=reply_markup)
+    return await bot.send_message(chat_id, text, reply_markup=reply_markup)
 
 
 # ---------------------------------------------------------------------------
@@ -1904,24 +1920,30 @@ async def phone_keyboard() -> ReplyKeyboardMarkup:
 
 
 def gate_keyboard(channels: list[aiosqlite.Row], join_label: str = "") -> InlineKeyboardMarkup:
-    """Channel-only gate keyboard. No Verify/Continue/Approval controls."""
+    """Channel gate keyboard: one button per channel plus a working
+    "I've Joined" button at the bottom that re-checks membership."""
     join_buttons = [
         InlineKeyboardButton(text=f"📢 {ch['title']}", url=ch['invite_link'])
         for ch in channels
     ]
-    return InlineKeyboardMarkup(inline_keyboard=_rows_of_two(join_buttons))
+    rows = _rows_of_two(join_buttons)
+    rows.append([InlineKeyboardButton(text=join_label or "✅ I've Joined / Check Again", callback_data="gate_check")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def build_gate_keyboard(bot: Bot, user_id: int, channels: list[aiosqlite.Row]) -> InlineKeyboardMarkup:
-    """Render only the required channel buttons.
+    """Render the required channel buttons plus a working "I've Joined" button.
 
-    Membership is verified automatically from Telegram chat/member updates;
-    there is deliberately no user-facing verification, approval, or navigation button here.
+    Telegram chat/member updates verify membership automatically in the
+    background, but that update can lag or be missed (privacy settings,
+    restricted accounts). This manual re-check button - wired to the
+    gate_check callback below - lets the user force an immediate re-check.
     """
     rows = [
         [InlineKeyboardButton(text=f"📢 {ch['title']}", url=ch['invite_link'])]
         for ch in channels
     ]
+    rows.append([InlineKeyboardButton(text=await ui_button("gate_check", "✅ I've Joined / Check Again"), callback_data="gate_check")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1990,6 +2012,8 @@ async def admin_panel_keyboard(admin_id: int | None = None) -> InlineKeyboardMar
         [InlineKeyboardButton(text="📊 Stats", callback_data="adm_stats"),
          InlineKeyboardButton(text=mode_label, callback_data="adm_mode")],
         [InlineKeyboardButton(text="✏️ Message & Button Editor", callback_data="adm_editor")],
+        [InlineKeyboardButton(text="🔀 Mode Messages", callback_data="adm_mode_msgs"),
+         InlineKeyboardButton(text="🖼 Message Photos", callback_data="adm_msg_photos")],
         [InlineKeyboardButton(text="🎁 Reward Caption", callback_data="adm_reward"),
          InlineKeyboardButton(text="⚙️ Reward Rules", callback_data="adm_reward_rules")],
         [InlineKeyboardButton(text="📞 Manage Numbers", callback_data="adm_numbers"),
@@ -2637,6 +2661,33 @@ async def _safe_get_message(bot:Bot,chat_id:int,message_id:int):
     return None
 
 
+@user_router.callback_query(F.data == "gate_check")
+async def cb_gate_check(callback: CallbackQuery, bot: Bot) -> None:
+    """Manual "I've Joined" button: forces an immediate re-check of every
+    required channel instead of waiting for Telegram's chat_member update."""
+    user_id = callback.from_user.id
+    user = await get_user(user_id)
+    if not user:
+        await callback.answer("Please send /start first.", show_alert=True)
+        return
+    if user["banned"] or user["restricted"]:
+        await callback.answer()
+        return
+    result = await _evaluate_required_channels(bot, user_id)
+    if result["all_member"]:
+        await maybe_credit_referral(user_id, bot)
+        await callback.answer("✅ Verified! Unlocking...")
+        await render_flow(bot, callback.message.chat.id, user_id, edit_message=callback.message)
+        return
+    missing = [c["title"] for c in result["channels"] if c["status"] not in {"MEMBER", "REQUESTED", "PENDING_APPROVAL", "APPROVED"}]
+    if missing:
+        await callback.answer("❌ You still need to join: " + ", ".join(missing), show_alert=True)
+    elif result["errors"]:
+        await callback.answer("⚠️ Couldn't verify right now — please try again in a moment.", show_alert=True)
+    else:
+        await callback.answer("⏳ Still pending approval — try again shortly.", show_alert=True)
+
+
 # --- Main menu (NO leaderboard for users) -----------------------------------
 
 @user_router.callback_query(F.data == "menu_link")
@@ -2648,18 +2699,18 @@ async def cb_referral_link(callback: CallbackQuery, bot: Bot) -> None:
     text=await ui_message("referral_link",link=link,referrals=count,required_referrals=required,reward=f"{await get_setting('reward_quantity','1')} Agent Number")
     share=f"https://t.me/share/url?url={quote(link,safe='')}&text={quote(await ui_message('share_caption'),safe='')}"
     kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=await ui_button("share_friend","📤 SHARE LINK"),url=share)],[InlineKeyboardButton(text=await ui_button("back","⬅️ Back"),callback_data="menu_back")]])
-    try: await callback.message.edit_text(text,reply_markup=kb)
-    except TelegramBadRequest: pass
+    await send_ui_text(bot, callback.message.chat.id, "referral_link", text, reply_markup=kb, edit_message=callback.message)
     await callback.answer()
 
 
 @user_router.callback_query(F.data == "menu_stats")
-async def cb_my_stats(callback: CallbackQuery) -> None:
+async def cb_my_stats(callback: CallbackQuery, bot: Bot) -> None:
     user=await get_user(callback.from_user.id)
     if not user: await callback.answer(await ui_message("no_user"),show_alert=True); return
     required=await get_required_referrals(); latest=await latest_reward(user["user_id"]); rc=await reward_count(user["user_id"])
     text=await ui_message("stats",progress=progress_bar(user["referral_count"],required),count=user["referral_count"],required=required,reward_count=rc,phone="Verified" if user["phone_verified"] else "Not verified",access="Verified" if user["joined_gate"] else "Pending",latest_reward=pretty_number(latest["reward_number"]) if latest else "—")
-    await callback.message.edit_text(text,reply_markup=await back_keyboard("menu_back")); await callback.answer()
+    await send_ui_text(bot, callback.message.chat.id, "stats", text, reply_markup=await back_keyboard("menu_back"), edit_message=callback.message)
+    await callback.answer()
 
 
 @user_router.callback_query(F.data == "my_reward")
@@ -4634,6 +4685,7 @@ async def v5_create_confirm(callback: CallbackQuery, state: FSMContext) -> None:
     clone_id = uuid.uuid4().hex[:16]
     db_path = str(Path(os.path.dirname(os.path.abspath(DB_PATH)) or ".") / "clones" / f"{clone_id}.db")
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    await _seed_clone_database(db_path)
     now = datetime.now(timezone.utc).isoformat()
     package = d["package"]
     async with aiosqlite.connect(DB_PATH) as db:
@@ -5141,6 +5193,178 @@ async def main() -> None:
                 except Exception:
                     logger.exception("Failed to stop clone %s", clone_id)
         await bot.session.close()
+
+
+# ---------------------------------------------------------------------------
+# Added: seed a brand-new clone database with the current channel list, so a
+# freshly created clone no longer starts with an empty "Manage Channels" list.
+# ---------------------------------------------------------------------------
+async def _seed_clone_database(db_path: str) -> None:
+    global DB_PATH
+    master_path = DB_PATH
+    DB_PATH = db_path
+    try:
+        await init_db()
+    finally:
+        DB_PATH = master_path
+    try:
+        async with aiosqlite.connect(master_path) as src:
+            src.row_factory = aiosqlite.Row
+            cur = await src.execute("SELECT * FROM channels")
+            channel_rows = list(await cur.fetchall())
+    except Exception:
+        channel_rows = []
+    if not channel_rows:
+        return
+    columns = list(channel_rows[0].keys())
+    colnames = ",".join(columns)
+    placeholders = ",".join("?" for _ in columns)
+    async with aiosqlite.connect(db_path) as dst:
+        for row in channel_rows:
+            await dst.execute(
+                f"INSERT OR IGNORE INTO channels({colnames}) VALUES({placeholders})",
+                tuple(row[c] for c in columns),
+            )
+        await dst.commit()
+
+
+# ---------------------------------------------------------------------------
+# Added: mode-specific message overrides + per-message photo admin tools
+# ---------------------------------------------------------------------------
+class ModeMsgStates(StatesGroup):
+    waiting_value = State()
+
+class MsgPhotoStates(StatesGroup):
+    waiting_photo = State()
+
+_MODE_MSG_KEYS = sorted(MODE_SCOPED_KEYS)
+
+def _mode_msg_list_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=k, callback_data=f"mmk:{k}")] for k in _MODE_MSG_KEYS]
+    rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="adm_back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+@admin_router.callback_query(F.data == "adm_mode_msgs")
+async def cb_adm_mode_msgs(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Not authorized.", show_alert=True); return
+    await state.clear()
+    mode = await get_bot_mode()
+    await callback.message.edit_text(
+        "🔀 <b>Mode-Specific Messages</b>\n\n"
+        f"Current bot mode: <b>{'🤝 Refer &amp; Earn' if mode == 'refer' else '🎯 Task &amp; Earn'}</b>\n\n"
+        "Pick a screen below. The text you send is shown ONLY while the bot is in "
+        "the current mode — switch modes here and set a different text for the other one.",
+        reply_markup=_mode_msg_list_keyboard(),
+    )
+    await callback.answer()
+
+@admin_router.callback_query(F.data.startswith("mmk:"))
+async def cb_adm_mode_msg_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Not authorized.", show_alert=True); return
+    key = callback.data.split(":", 1)[1]
+    if key not in MODE_SCOPED_KEYS:
+        await callback.answer("Invalid key.", show_alert=True); return
+    mode = await get_bot_mode()
+    current = await get_setting(f"ui_msg:{mode}::{key}", "")
+    current_display = current or "(using the shared default text — not overridden for this mode yet)"
+    await state.set_state(ModeMsgStates.waiting_value)
+    await state.update_data(mode_msg_key=key)
+    await callback.message.edit_text(
+        f"✏️ <b>Editing '{hesc(key)}' for {'Refer &amp; Earn' if mode == 'refer' else 'Task &amp; Earn'} mode</b>\n\n"
+        f"Current:\n{hesc(current_display)}\n\n"
+        "Send the new HTML text now. Send /reset to remove the override and go back to the shared text.",
+        reply_markup=await cancel_keyboard("adm_mode_msgs"),
+    )
+    await callback.answer()
+
+@admin_router.message(ModeMsgStates.waiting_value)
+async def process_mode_msg_value(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    key = data.get("mode_msg_key")
+    if not key:
+        await state.clear(); return
+    mode = await get_bot_mode()
+    if (message.text or "").strip() == "/reset":
+        await set_setting(f"ui_msg:{mode}::{key}", "")
+        await message.answer("♻️ Override removed — back to the shared text.", reply_markup=await back_keyboard("adm_mode_msgs"))
+        await state.clear()
+        return
+    value = message.html_text or message.text or ""
+    try:
+        await save_ui_message(key, value, changed_by=message.from_user.id, mode_scoped=True)
+    except ValueError as exc:
+        await message.answer(f"❌ {hesc(str(exc))}")
+        return
+    await message.answer(await ui_message("message_saved"), reply_markup=await back_keyboard("adm_mode_msgs"))
+    await state.clear()
+
+def _msg_photo_list_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=k, callback_data=f"mpk:{k}")] for k in sorted(UI_MESSAGES.keys())]
+    rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="adm_back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+@admin_router.callback_query(F.data == "adm_msg_photos")
+async def cb_adm_msg_photos(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Not authorized.", show_alert=True); return
+    await state.clear()
+    await callback.message.edit_text(
+        "🖼 <b>Message Photos</b>\n\n"
+        "Pick a screen below to attach a photo above its text, or remove one that's already set.\n\n"
+        "Live on the Referral Link and Status screens today; the same tool stores a photo "
+        "for any key so more screens can be switched over later.",
+        reply_markup=_msg_photo_list_keyboard(),
+    )
+    await callback.answer()
+
+@admin_router.callback_query(F.data.startswith("mpk:"))
+async def cb_adm_msg_photo_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Not authorized.", show_alert=True); return
+    key = callback.data.split(":", 1)[1]
+    if key not in UI_MESSAGES:
+        await callback.answer("Invalid key.", show_alert=True); return
+    await state.set_state(MsgPhotoStates.waiting_photo)
+    await state.update_data(photo_key=key)
+    current = await get_ui_photo(key)
+    await callback.message.edit_text(
+        f"🖼 <b>Photo for '{hesc(key)}'</b>\n\n"
+        f"{'A photo is currently attached.' if current else 'No photo attached yet.'}\n\n"
+        "Send a photo to attach it, or send /remove to clear it.",
+        reply_markup=await cancel_keyboard("adm_msg_photos"),
+    )
+    await callback.answer()
+
+@admin_router.message(MsgPhotoStates.waiting_photo, F.photo)
+async def process_msg_photo(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    key = data.get("photo_key")
+    if not key:
+        await state.clear(); return
+    await save_ui_photo(key, message.photo[-1].file_id)
+    await message.answer("✅ Photo attached.", reply_markup=await back_keyboard("adm_msg_photos"))
+    await state.clear()
+
+@admin_router.message(MsgPhotoStates.waiting_photo)
+async def process_msg_photo_text(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    if (message.text or "").strip() == "/remove":
+        data = await state.get_data()
+        key = data.get("photo_key")
+        if key:
+            await clear_ui_photo(key)
+        await message.answer("🗑 Photo removed.", reply_markup=await back_keyboard("adm_msg_photos"))
+        await state.clear()
+        return
+    await message.answer("Send a photo, or /remove to clear it.")
+
 
 
 if __name__ == "__main__":
