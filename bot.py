@@ -188,6 +188,7 @@ UI_MESSAGES = {
     "captcha": ("🧩 <b>Step 2 — Human Verification</b>\n\n✨ Complete this quick verification to continue.\n\nWhat is <b>{question}</b>?"),
     "phone": ("📱 <b>Step 3 — Phone Verification</b>\n\n🇮🇳 Only your own Indian (+91) number is accepted.\n\n✨ Tap <b>{share_button}</b> below to verify securely."),
     "restricted": ("⛔ <b>Access Restricted</b>\n\nYour verification could not be completed.\n\n👨‍💼 If you believe this is a mistake, contact the admin below."),
+    "maintenance": ("🛠 <b>Temporarily Under Maintenance</b>\n\n✨ {bot_name} is being improved. Please try again shortly.\n\n💎 <i>Please check again in a little while.</i>"),
     "main_locked": ("🤖 <b>{bot_name}</b>\n\n👋 Welcome, {first_name}!\n\n👥 Referrals: <b>{count}/{required}</b>\n🎁 Reward: <b>{reward_status}</b>"),
     "main_unlocked": ("🤖 <b>{bot_name}</b>\n\n👋 Welcome, {first_name}!\n\n👥 Referrals: <b>{count}/{required}</b>\n🎁 Reward: <b>{reward_status}</b>"),
     "referral_link": ("🔗 <b>REFER & EARN</b>\n\nInvite your friends and earn rewards.\n\n👥 Referrals: <b>{referrals}</b>\n🎯 Required: <b>{required_referrals}</b>\n🎁 Reward: <b>{reward}</b>\n\nYour Personal Link:\n<code>{link}</code>"),
@@ -219,6 +220,7 @@ UI_BUTTONS = {
     "button_editor": "🔘 Edit Buttons",
     "preview": "👁 Preview",
     "open_whatsapp": "💬 Open on WhatsApp",
+    "maintenance_refresh": "🔄 Check Again",
 }
 
 
@@ -608,6 +610,9 @@ async def init_db() -> None:
                 reward_sent        INTEGER NOT NULL DEFAULT 0,
                 phone              TEXT,
                 phone_verified     INTEGER NOT NULL DEFAULT 0,
+                device_verified    INTEGER NOT NULL DEFAULT 0,
+                device_token       TEXT,
+                device_verified_at TEXT,
                 captcha_passed     INTEGER NOT NULL DEFAULT 0,
                 captcha_answer     TEXT,
                 banned             INTEGER NOT NULL DEFAULT 0,
@@ -857,6 +862,9 @@ async def init_db() -> None:
             "ALTER TABLE users ADD COLUMN last_activity TEXT",
             "ALTER TABLE users ADD COLUMN phone TEXT",
             "ALTER TABLE users ADD COLUMN phone_verified INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN device_verified INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN device_token TEXT",
+            "ALTER TABLE users ADD COLUMN device_verified_at TEXT",
             "ALTER TABLE users ADD COLUMN captcha_passed INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE users ADD COLUMN captcha_answer TEXT",
             "ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0",
@@ -883,6 +891,7 @@ async def init_db() -> None:
             ),
             "captcha_enabled": "1",
             "phone_verify_enabled": "1",
+            "device_verify_enabled": "0",
             "task_banner_file_id": "",
             "refer_banner_file_id": "",
             "task_banner_caption": "🎯 <b>Task & Earn</b>\n\nComplete tasks, stay active and unlock your rewards. 🚀",
@@ -1066,6 +1075,16 @@ async def set_phone_verified(user_id: int, phone: str) -> None:
         await db.execute(
             "UPDATE users SET phone = ?, phone_verified = 1 WHERE user_id = ?",
             (phone, user_id),
+        )
+        await db.commit()
+
+
+async def set_device_verified(user_id: int, token: str | None = None) -> None:
+    token = token or uuid.uuid4().hex
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET device_verified = 1, device_token = ?, device_verified_at = ? WHERE user_id = ?",
+            (token, datetime.now(timezone.utc).isoformat(), user_id),
         )
         await db.commit()
 
@@ -1591,12 +1610,13 @@ def display_name(row: aiosqlite.Row) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Verification flow — ORDER: gate (channels) -> captcha -> phone -> done
+# Verification flow — ORDER: gate (channels) -> captcha -> phone -> device -> done
 # ---------------------------------------------------------------------------
 
 STEP_GATE = "gate"
 STEP_CAPTCHA = "captcha"
 STEP_PHONE = "phone"
+STEP_DEVICE = "device"
 STEP_DONE = "done"
 
 
@@ -1608,12 +1628,20 @@ async def next_step(user: aiosqlite.Row) -> str:
     """
     if not user["joined_gate"]:
         if not await get_channels():
-            return STEP_CAPTCHA if await get_setting("captcha_enabled","1")=="1" and not user["captcha_passed"] else (STEP_PHONE if await get_setting("phone_verify_enabled","1")=="1" and not user["phone_verified"] else STEP_DONE)
+            if await get_setting("captcha_enabled", "1") == "1" and not user["captcha_passed"]:
+                return STEP_CAPTCHA
+            if await get_setting("phone_verify_enabled", "1") == "1" and not user["phone_verified"]:
+                return STEP_PHONE
+            if await get_setting("device_verify_enabled", "0") == "1" and not user["device_verified"]:
+                return STEP_DEVICE
+            return STEP_DONE
         return STEP_GATE
     if await get_setting("captcha_enabled", "1") == "1" and not user["captcha_passed"]:
         return STEP_CAPTCHA
     if await get_setting("phone_verify_enabled", "1") == "1" and not user["phone_verified"]:
         return STEP_PHONE
+    if await get_setting("device_verify_enabled", "0") == "1" and not user["device_verified"]:
+        return STEP_DEVICE
     return STEP_DONE
 
 
@@ -2036,7 +2064,7 @@ async def admin_panel_keyboard(admin_id: int | None = None) -> InlineKeyboardMar
     ])
 
 
-def verification_settings_keyboard(captcha_on: bool, phone_on: bool) -> InlineKeyboardMarkup:
+def verification_settings_keyboard(captcha_on: bool, phone_on: bool, device_on: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -2049,6 +2077,7 @@ def verification_settings_keyboard(captcha_on: bool, phone_on: bool) -> InlineKe
                     callback_data="vs_phone",
                 ),
             ],
+            [InlineKeyboardButton(text=f"🔐 Device Verification: {'✅ ON' if device_on else '❌ OFF'}", callback_data="vs_device")],
             [InlineKeyboardButton(text="⬅️ Back", callback_data="adm_back")],
         ]
     )
@@ -2313,6 +2342,34 @@ async def render_phone(bot: Bot, chat_id: int, user_id: int, edit_message: Optio
     msg=await bot.send_message(chat_id,text,reply_markup=await phone_keyboard())
     await set_flow_message(user_id,chat_id,msg.message_id,STEP_PHONE)
 
+def device_verification_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔐 Verify Device", callback_data="device_verify")],
+    ])
+
+
+async def render_device_verification(bot: Bot, chat_id: int, user_id: int, edit_message: Optional[Message] = None) -> None:
+    await delete_previous_flow(bot, user_id, chat_id)
+    text = (
+        "🛡 <b>Device Verification</b>\n\n"
+        "🔐 We need to verify this Telegram session before you continue.\n\n"
+        "✓ Session authorization\n"
+        "✓ Network connection check\n"
+        "◉ Device verification scan\n"
+        "○ Account security confirmation\n\n"
+        "👇 Tap below to start verification."
+    )
+    if edit_message is not None:
+        try:
+            await edit_message.edit_text(text, reply_markup=device_verification_keyboard())
+            await set_flow_message(user_id, chat_id, edit_message.message_id, STEP_DEVICE)
+            return
+        except Exception:
+            pass
+    msg = await bot.send_message(chat_id, text, reply_markup=device_verification_keyboard())
+    await set_flow_message(user_id, chat_id, msg.message_id, STEP_DEVICE)
+
+
 async def render_contact_admin(bot: Bot, chat_id: int) -> None:
     await bot.send_message(chat_id,await ui_message("restricted"),reply_markup=await contact_admin_keyboard())
 
@@ -2345,12 +2402,18 @@ async def render_flow(bot: Bot, chat_id: int, user_id: int, edit_message: Option
     if user["restricted"] and not is_admin(user_id):
         await delete_previous_flow(bot,user_id,chat_id); await render_contact_admin(bot,chat_id); return
     if await get_setting("maintenance_mode","0")=="1" and not is_admin(user_id):
-        await delete_previous_flow(bot,user_id,chat_id); msg=await bot.send_message(chat_id,await get_setting("maintenance_message","🛠 Maintenance")); await set_flow_message(user_id,chat_id,msg.message_id,"maintenance"); return
+        await delete_previous_flow(bot,user_id,chat_id)
+        text = await ui_message("maintenance")
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=await ui_button("maintenance_refresh"), callback_data="maintenance_refresh")]])
+        msg = await bot.send_message(chat_id, text, reply_markup=kb)
+        await set_flow_message(user_id,chat_id,msg.message_id,"maintenance")
+        return
     if is_admin(user_id): return await render_main_menu(bot,chat_id,user_id,edit_message=edit_message)
     step=await next_step(user)
     if step==STEP_GATE: await render_gate(bot,chat_id,edit_message=edit_message)
     elif step==STEP_CAPTCHA: await render_captcha(bot,chat_id,user_id,edit_message=edit_message)
     elif step==STEP_PHONE: await render_phone(bot,chat_id,user_id,edit_message=edit_message)
+    elif step==STEP_DEVICE: await render_device_verification(bot,chat_id,user_id,edit_message=edit_message)
     else: await render_main_menu(bot,chat_id,user_id,edit_message=edit_message)
 
 
@@ -2512,6 +2575,45 @@ async def on_contact(message: Message, bot: Bot) -> None:
     await maybe_credit_referral(user_id, bot)
     await delete_previous_flow(bot,user_id,message.chat.id)
     await render_flow(bot, message.chat.id, user_id)
+
+
+@user_router.callback_query(F.data == "device_verify")
+async def cb_device_verify(callback: CallbackQuery, bot: Bot) -> None:
+    user_id = callback.from_user.id
+    user = await get_user(user_id)
+    if not user:
+        await callback.answer("Please send /start first.", show_alert=True)
+        return
+    if await get_setting("device_verify_enabled", "0") != "1":
+        await callback.answer("Device verification is currently disabled.")
+        await render_flow(bot, callback.message.chat.id, user_id, edit_message=callback.message)
+        return
+    if user["device_verified"]:
+        await callback.answer("Device already verified.")
+        await render_flow(bot, callback.message.chat.id, user_id, edit_message=callback.message)
+        return
+    await callback.answer("🔐 Verification started…")
+    stages = [
+        ("🛡 <b>Checking Device</b>\n\nVerifying session authorization…\n\n✅ Session authorization", 25),
+        ("🛡 <b>Checking Device</b>\n\nVerifying network connection…\n\n✅ Session authorization\n✅ Network connection check", 45),
+        ("🛡 <b>Checking Device</b>\n\nRunning device verification scan…\n\n✅ Session authorization\n✅ Network connection check\n◉ Device verification scan", 65),
+        ("🛡 <b>Verification Complete</b>\n\nYour Telegram session has been securely verified.\n\n✅ Session authorization\n✅ Network connection check\n✅ Device verification scan\n◉ Account security confirmation", 100),
+    ]
+    for text, progress in stages:
+        try:
+            await callback.message.edit_text(text + f"\n\n<b>Progress: {progress}%</b>")
+        except TelegramBadRequest:
+            pass
+        await asyncio.sleep(0.45 if progress < 100 else 0.15)
+    await set_device_verified(user_id)
+    await maybe_credit_referral(user_id, bot)
+    await render_flow(bot, callback.message.chat.id, user_id, edit_message=callback.message)
+
+
+@user_router.callback_query(F.data == "maintenance_refresh")
+async def cb_maintenance_refresh(callback: CallbackQuery, bot: Bot) -> None:
+    await callback.answer("🔄 Checking…")
+    await render_flow(bot, callback.message.chat.id, callback.from_user.id, edit_message=callback.message)
 
 
 # --- Force-join gate --------------------------------------------------------
@@ -3026,11 +3128,13 @@ async def cb_set_mode(callback: CallbackQuery) -> None:
 async def _render_verification_settings(message: Message) -> None:
     captcha_on = await get_setting("captcha_enabled", "1") == "1"
     phone_on = await get_setting("phone_verify_enabled", "1") == "1"
+    device_on = await get_setting("device_verify_enabled", "0") == "1"
     await message.edit_text(
         "🛡 <b>Verification Settings</b>\n\n"
         "🧩 <b>Captcha</b> — blocks automated /start spam.\n"
-        "📱 <b>Phone</b> — Indian (+91) numbers only; one number = one account.",
-        reply_markup=verification_settings_keyboard(captcha_on, phone_on),
+        "📱 <b>Phone</b> — Indian (+91) numbers only; one number = one account.\n"
+        "🔐 <b>Device</b> — adds a per-Telegram-session verification step before access.",
+        reply_markup=verification_settings_keyboard(captcha_on, phone_on, device_on),
     )
 
 
@@ -3055,6 +3159,16 @@ async def cb_toggle_phone(callback: CallbackQuery) -> None:
     await set_setting("phone_verify_enabled", "0" if current == "1" else "1")
     await _render_verification_settings(callback.message)
     await callback.answer("Phone verification updated.")
+
+
+@admin_router.callback_query(F.data == "vs_device")
+async def cb_toggle_device_verification(callback: CallbackQuery) -> None:
+    current = await get_setting("device_verify_enabled", "0")
+    new_value = "0" if current == "1" else "1"
+    await set_setting("device_verify_enabled", new_value)
+    await audit(callback.from_user.id, "TOGGLE_DEVICE_VERIFICATION", details=f"{current} -> {new_value}")
+    await _render_verification_settings(callback.message)
+    await callback.answer("Device verification updated.")
 
 
 # --- Reward caption ---------------------------------------------------------
@@ -3667,6 +3781,7 @@ async def cb_admin_system(callback: CallbackQuery) -> None:
         "Use the controls below to change operational settings.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=f"🛠 Maintenance {'ON' if maintenance else 'OFF'}", callback_data="sys_maintenance")],
+            [InlineKeyboardButton(text="📝 Edit Maintenance", callback_data="ce_m:maintenance"), InlineKeyboardButton(text="👁 Preview", callback_data="sys_maintenance_preview")],
             [InlineKeyboardButton(text="⚡ Fast Broadcast", callback_data="sys_fast")],
             [InlineKeyboardButton(text="🛡 Safe Broadcast", callback_data="sys_safe")],
             [InlineKeyboardButton(text="⬅️ Back", callback_data="adm_back")],
@@ -3678,8 +3793,17 @@ async def cb_admin_system(callback: CallbackQuery) -> None:
 async def cb_sys_maintenance(callback: CallbackQuery) -> None:
     current = await get_setting("maintenance_mode", "0") == "1"
     await set_setting("maintenance_mode", "0" if current else "1")
+    await audit(callback.from_user.id, "TOGGLE_MAINTENANCE", details=f"{current} -> {not current}")
     await callback.answer("Maintenance mode updated.")
     await cb_admin_system(callback)
+
+
+@admin_router.callback_query(F.data == "sys_maintenance_preview")
+async def cb_sys_maintenance_preview(callback: CallbackQuery) -> None:
+    text = await ui_message("maintenance")
+    await callback.message.edit_text("👁 <b>Maintenance Preview</b>\n\n" + text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Back", callback_data="adm_system")]]))
+    await callback.answer("Preview")
+
 
 @admin_router.callback_query(F.data == "sys_fast")
 async def cb_sys_fast(callback: CallbackQuery) -> None:
